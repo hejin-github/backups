@@ -1340,6 +1340,321 @@ def _pending_signals_html():
         return ''
 
 
+# ============================================================
+# 全策略模拟信号记录（总账）
+# 口径（2026-09-09 用户）：买入信号/换仓候选/卖出信号各自登记一行（同日一事件可分两行）；
+#   “记录信号日就买入”——任一买入类信号在其信号日当天即按当日收盘价虚拟买入，不等 T+1 成交；
+#   卖出统一比两种卖法的模拟收益：①卖出信号日收盘卖（卖出信号日成交收益）
+#   ②实际卖出成交日卖（卖出成交日收益，卖价=真实平仓价）。
+# ============================================================
+_SL_IDX = {'沪深300指数', '红利指数', '中证500指数', '上证50指数'}
+_SL_BAD = ('已换仓', '已废弃', '废弃', '过滤', '不可买', '顶板', '买不进', '低开')
+_SL_STOP = re.compile(r'收盘触发.{0,8}(止损|卖出|平仓)信号')
+_SL_UNIV = None
+_SL_UNIV_LOAD = False
+_SL_CSV = {}
+
+
+def _sl_norm(x):
+    return re.sub(r'\s+', '', str(x or ''))
+
+
+def _sl_num(x):
+    try:
+        float(x)
+        return True
+    except Exception:
+        return False
+
+
+def _sl_code(name):
+    """名称→代码（全市场股票池 stock_universe.csv）"""
+    global _SL_UNIV, _SL_UNIV_LOAD
+    if not _SL_UNIV_LOAD:
+        _SL_UNIV_LOAD = True
+        _SL_UNIV = {}
+        try:
+            for line in open('data/stock_universe.csv', encoding='utf-8-sig'):
+                line = line.strip()
+                if not line or line.startswith('code'):
+                    continue
+                p = line.split(',')
+                if len(p) >= 2:
+                    _SL_UNIV[_sl_norm(p[1])] = str(p[0]).strip()
+        except Exception:
+            pass
+    return (_SL_UNIV or {}).get(_sl_norm(name))
+
+
+def _sl_close_of(name, date):
+    """目标在信号日收盘价（=“记录信号日就买入”的虚拟买入价）"""
+    code = _sl_code(name)
+    if not code:
+        return None
+    if code not in _SL_CSV:
+        import pandas as pd
+        try:
+            df = pd.read_csv(f'data/csv/{code}.csv', dtype={'股票代码': str})
+            df['日期'] = df['日期'].astype(str)
+            _SL_CSV[code] = df
+        except Exception:
+            _SL_CSV[code] = None
+    df = _SL_CSV.get(code)
+    if df is None or df.empty:
+        return None
+    m = df.loc[df['日期'] == str(date), '收盘']
+    if m.empty:
+        return None
+    try:
+        return float(m.iloc[0])
+    except Exception:
+        return None
+
+
+def _sl_close(r):
+    """行内信号日参考价（判定日收盘）"""
+    return float(r['price']) if _sl_num(r.get('price')) else None
+
+
+def _sl_sellpx(r):
+    """实际卖出成交价（换仓卖出行 sell_price 保留原卖出价）"""
+    for k in ('sell_price', 'deal_price'):
+        if _sl_num(r.get(k)):
+            return float(r[k])
+    return None
+
+
+def _sl_pend_cand(rb):
+    """返回 rec_buy 里的待执行换仓候选名（已换仓/废弃/过滤等不算），无则 None"""
+    rb = str(rb or '')
+    if '（评分' in rb and not any(w in rb for w in _SL_BAD):
+        n = _sl_norm(rb.split('（')[0])
+        return n or None
+    return None
+
+
+def _sl_is_sell_sig(r):
+    st = str(r.get('status') or '')
+    if st in ('卖出信号', '卖出顺延'):
+        return True
+    return bool(_SL_STOP.search(str(r.get('note') or '')))
+
+
+def _sl_ledger_rows():
+    """全策略模拟信号记录（总账）行。最新在前；每行=一次信号事件。
+    行字段：date登记日, type(买入信号/换仓候选/卖出信号), name, code,
+    b_date/b_px 虚拟买入基准(信号日收盘), a_date/a_px 卖出信号日, pA,
+    b2_date/b2_px 实际卖出成交日, pB, state, remark"""
+    out = []
+    try:
+        for s in (HISTORY or {}).get('strategies', []):
+            daily = sorted([r for r in s.get('daily', [])
+                            if str(r.get('date', '')) >= SIM_START],
+                           key=lambda r: str(r['date']))
+            if not daily:
+                continue
+            buy_ev, sell_ev = [], []
+            cand_runs, buy_runs = {}, {}      # name -> i（连续候选/待成交只记最早）
+            for i, r in enumerate(daily):
+                date = str(r['date']); st = str(r.get('status') or '')
+                name = _sl_norm(r.get('name') or ''); rb = str(r.get('rec_buy') or '')
+                if st == '信号废弃':
+                    cand_runs, buy_runs = {}, {}
+                    continue
+                if st in ('卖出成交', '建仓'):
+                    buy_runs.pop(name, None)
+                    cand_runs.pop(name, None)
+                c = _sl_pend_cand(rb)
+                if c:
+                    if c not in cand_runs:
+                        cand_runs[c] = i
+                        buy_ev.append({'type': '换仓候选', 'date': date, 'name': c,
+                                       'close': None, 'i': i})
+                elif rb:
+                    cand_runs = {}
+                else:
+                    cand_runs = {}
+                if st in ('买入信号', '买入信号(待成交)') and name and name not in _SL_IDX:
+                    if st == '买入信号' or name not in buy_runs:
+                        buy_runs[name] = i
+                        buy_ev.append({'type': '买入信号', 'date': date, 'name': name,
+                                       'close': _sl_close(r), 'i': i})
+                if st == '卖出信号' and name and name not in _SL_IDX:
+                    sell_ev.append({'date': str(r['date']), 'name': name,
+                                    'close': _sl_close(r), 'i': i})
+
+            def _exit_of(i0, nm):
+                """真实盘该信号后续：(是否买入, 卖出信号日(date,close), 卖出成交日(date,卖价))"""
+                acq = False; sig = None; ex = None
+                for k in range(i0 + 1, len(daily)):
+                    r = daily[k]
+                    st = str(r.get('status') or '')
+                    nm2 = _sl_norm(r.get('name') or '')
+                    note = _sl_norm(str(r.get('note') or ''))
+                    hit = (nm2 == nm)
+                    if not acq:
+                        if hit and st in ('持有', '建仓'):
+                            acq = True
+                        elif (st in ('卖出成交', '建仓') and ('换仓买入' + nm) in note):
+                            acq = True
+                        elif hit and st in ('卖出信号', '卖出成交', '卖出顺延'):
+                            break          # 无建仓先遇卖出 → 非本周期
+                        else:
+                            continue
+                    if sig is None and hit and _sl_is_sell_sig(r):
+                        sig = (str(r['date']), _sl_close(r))
+                    if st == '卖出成交' and hit:
+                        ex = (str(r['date']), _sl_sellpx(r))
+                        break
+                return acq, sig, ex
+
+            cyc = []
+            for e in buy_ev:
+                acq, sig, ex = _exit_of(e['i'], e['name'])
+                if e['close'] is None:
+                    e['close'] = _sl_close_of(e['name'], e['date'])
+                e.update(acq=acq, sig=sig, ex=ex)
+                cyc.append(e)
+
+            # 卖出信号行（对应其周期买入基准，两卖法收益一并给出）
+            for e in sell_ev:
+                anch = None
+                for c in cyc:
+                    if c['name'] == e['name'] and c['date'] <= e['date'] and c['acq']:
+                        anch = c
+                if anch is None:
+                    continue
+                out.append({
+                    'sid': s['name'], 'type': '卖出信号', 'name': e['name'],
+                    'code': _sl_code(e['name']), 'date': e['date'],
+                    'b_date': anch['date'], 'b_px': anch['close'],
+                    'a_date': e['date'], 'a_px': e['close'],
+                    'b2_date': anch['ex'][0] if anch['ex'] else None,
+                    'b2_px': anch['ex'][1] if anch['ex'] else None,
+                    'cycle': anch, 'entry_type': anch['type'],
+                    'active': bool(cand_runs.get(anch['name']) == anch['i']
+                                   or buy_runs.get(anch['name']) == anch['i']),
+                })
+
+            # 买入信号 / 换仓候选 行
+            for c in cyc:
+                if c['acq']:
+                    state = ('已卖出' if c['ex'] else
+                             ('待卖出成交' if c['sig'] else '持仓中'))
+                else:
+                    active = bool(cand_runs.get(c['name']) == c['i']
+                                  or buy_runs.get(c['name']) == c['i'])
+                    state = '待执行' if active else '未买成'
+                out.append({
+                    'sid': s['name'], 'type': c['type'], 'name': c['name'],
+                    'code': _sl_code(c['name']), 'date': c['date'],
+                    'b_date': c['date'], 'b_px': c['close'],
+                    'a_date': c['sig'][0] if c['sig'] else None,
+                    'a_px': c['sig'][1] if c['sig'] else None,
+                    'b2_date': c['ex'][0] if c['ex'] else None,
+                    'b2_px': c['ex'][1] if c['ex'] else None,
+                    'cycle': c, 'entry_type': c['type'],
+                    'active': bool(cand_runs.get(c['name']) == c['i']
+                                   or buy_runs.get(c['name']) == c['i']),
+                    'state': state,
+                })
+    except Exception:
+        return []
+    # 最新在前
+    out.sort(key=lambda x: (x.get('date') or '', x.get('sid') or ''), reverse=True)
+    return out
+
+
+def _sl_retpct(a, b):
+    """b/a - 1 的百分比；任一缺失返回 None"""
+    if a is None or b is None or not _sl_num(a) or not _sl_num(b):
+        return None
+    return (float(b) / float(a) - 1.0) * 100.0
+
+
+def _sl_pct_html(v):
+    if v is None:
+        return '<span class="muted">—</span>'
+    cls = 'up' if v > 0 else ('down' if v < 0 else '')
+    return f'<span class="{cls}">{v:+.2f}%</span>'
+
+
+def _signal_ledger_card():
+    """首页「全策略模拟信号记录（总账）」，置于今日行动清单之后、成交流水之前"""
+    rows = _sl_ledger_rows()
+    if not rows:
+        return ''
+    shown, more = rows[:15], rows[15:]
+    h2 = ('💡 全策略模拟信号记录（总账）'
+          '<span class="muted">买入信号/换仓候选/卖出信号<b>在信号日当天即登记</b>'
+          '（不等 T+1 成交）；买入类信号按<b>“记录信号日就买入”=信号日收盘价</b>虚拟买入，'
+          '卖出给两种模拟口径：卖出信号日收盘卖、实际卖出成交日卖。最新在前</span>')
+    note = ('<p class="note">口径：<b>买入信号/换仓候选</b>信号日即虚拟买入（虚拟买入价=信号日收盘价，'
+            '不依赖次日 T+1 真实成交）；<b>卖出信号</b>登记行给出“若信号出现当日收盘即卖”的收益，'
+            '对照列再给“真实卖出成交日”（真实平仓价）收益，二者均相对该笔信号日收盘的虚拟买入价计算。'
+            '信号确认后按 T+1 执行的交易会在成交流水（下表）同步记录；因顶板/低开证伪、资金不足等未买成的'
+            '买入类信号本表照实登记、两卖出列留空（状态=未买成），不再生成成交流水。</p>')
+    body = ''
+    for r in shown:
+        body += _sl_ledger_row(r)
+    head = ('<table><thead><tr><th>策略</th><th>记录类型</th><th>标的</th>'
+            '<th>买入信号日<br><span class="muted">(记录信号日就买入)</span></th>'
+            '<th>信号日收盘<br><span class="muted">(虚拟买入价)</span></th>'
+            '<th>卖出信号日</th><th>卖出信号日成交收益</th>'
+            '<th>卖出成交日</th><th>卖出成交日收益</th><th>状态</th><th>说明</th></tr></thead><tbody>')
+    out = (f'<div class="card"><h2>{h2}</h2>{note}'
+           f'<div class="tbl-wrap">{head}{body}</tbody></table></div>')
+    if more:
+        out += (f'<details><summary>展开全部（共 {len(rows)} 条，还有 {len(more)} 条）</summary>'
+                f'<div class="tbl-wrap">{head}'
+                + ''.join(_sl_ledger_row(r) for r in more) + '</tbody></table></div></details>')
+    out += '</div>'
+    return out
+
+
+def _sl_ledger_row(r):
+    b_date, b_px = r.get('b_date'), r.get('b_px')
+    a_date, a_px = r.get('a_date'), r.get('a_px')
+    b2_date, b2_px = r.get('b2_date'), r.get('b2_px')
+    pA = _sl_retpct(b_px, a_px)
+    pB = _sl_retpct(b_px, b2_px)
+    # 记录类型徽标
+    tcls = {'买入信号': 'ok', '换仓候选': 'warn', '卖出信号': 'sell'}.get(r['type'], '')
+    tlab = {'买入信号': '买入信号', '换仓候选': '买入·换仓候选'}.get(r['type'], r['type'])
+    _sid = str(r['sid']).split('_')[0]
+    _short = str(r['sid']).split('_', 1)[1] if '_' in str(r['sid']) else ''
+    slink = f'<a href="/s/{urllib.parse.quote(str(r["sid"]))}">{html.escape(_sid + " " + _short)}</a>'
+    code_html = f'<span class="muted">（{html.escape(str(r.get("code") or ""))}）</span>'
+    state, scls = r.get('state', ''), 'gray'
+    state_cls = {'待执行': 'warn', '未买成': 'gray', '持仓中': 'hold',
+                 '待卖出成交': 'sell', '已卖出': 'ok'}.get(state, 'gray')
+    remark = ''
+    if state == '持仓中' and r['type'] != '卖出信号':
+        remark = '真实盘仍持仓；卖出列待其后卖出信号/成交后回填'
+    elif state == '待卖出成交':
+        remark = f'{a_date} 卖出信号（收盘判定），实际卖出成交待 T+1 后回填'
+    elif state == '待执行':
+        remark = '信号已确认，T+1 按策略时点执行；顶板/低开证伪则废弃不买'
+    elif state == '未买成':
+        remark = '真实盘未成交（顶板/低开证伪、资金不足或候选被替换），本表仅登记信号'
+    elif state == '已卖出':
+        remark = f'真实盘于 {b2_date} 平仓（若 b2 列缺失为换仓行）'
+    else:
+        remark = r.get('entry_type', '')
+    remark = remark if remark and remark != 'None' else ''
+    return (
+        f'<tr><td class="note">{slink}</td>'
+        f'<td><b class="st {tcls}">{html.escape(tlab)}</b>'
+        f'{("<span class=muted>（登记）</span>") if r["type"] == "卖出信号" else ""}</td>'
+        f'<td><b>{html.escape(str(r["name"]))}</b>{code_html}</td>'
+        f'<td>{html.escape(str(b_date or "—"))}</td>'
+        f'<td>{b_px if b_px is not None else "—"}</td>'
+        f'<td>{html.escape(str(a_date or "—"))}</td><td>{_sl_pct_html(pA)}</td>'
+        f'<td>{html.escape(str(b2_date or "—"))}</td><td>{_sl_pct_html(pB)}</td>'
+        f'<td><b class="st {state_cls}">{html.escape(state or "登记")}</b></td>'
+        f'<td class="note">{html.escape(remark)}</td></tr>')
+
+
 def _ledger_card(rows):
     """首页「策略选股回放与每日推荐」下方全策略模拟成交总账：默认10条，其余折叠展开"""
     if not rows:
@@ -3031,6 +3346,7 @@ def render_index(query=None):
 
     body = (f'<h1>📊 策略选股回放与每日推荐</h1>\n'
             f'{today_action_card()}\n'
+            f'{_signal_ledger_card()}\n'
             f'{_ledger_card(_sim_ledger_rows())}\n'
             f'{info}\n{today_alert_card()}\n{yesterday_signal_card()}\n{guide}\n{rec_html}\n'
             f'{sh_aid_card()}\n'
