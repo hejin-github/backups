@@ -45,8 +45,10 @@ stock_bot_quant_web/
 | `data/notify_config.json` | 推送渠道配置（channel + token/webhook/密钥） | 无推送 |
 | `data/strategy_daily.json` | 引擎产出：各策略每日记录 | 空库可后台重建（30~60s+） |
 
-首次部署到新机器需自行补齐上述数据（akshare 拉取脚本在本仓库之外），并在
-`data/notify_config.json` 填写推送渠道。核心源码不包含任何密钥。
+首次部署到新机器需自行补齐上述数据；重建方法与脚本**已随本仓库提供**，见
+[`data_rebuild/DATA_REBUILD.md`](data_rebuild/DATA_REBUILD.md)（含脱敏推送配置模板
+`data_rebuild/notify_config.example.json` 与 4 个拉取脚本，复制到工程根执行）。
+核心源码不包含任何密钥。
 
 ## 策略清单
 

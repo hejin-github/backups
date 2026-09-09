@@ -1,0 +1,24 @@
+{
+  "_comment": "本文件为脱敏模板。复制为工程根 data/notify_config.json 后填写真实凭证即可恢复推送；真实值请勿提交本仓库。",
+  "enabled": true,
+  "channel": "qmail",
+  "daily_limit": 500,
+  "qywx": {
+    "webhook": ""
+  },
+  "dingtalk": {
+    "webhook": "",
+    "secret": ""
+  },
+  "feishu": {
+    "webhook": ""
+  },
+  "serverchan": {
+    "sendkey": "SCT<此处填Server酱SendKey，形如SCT1AbCdEfGhIjKlMn>"
+  },
+  "qmail": {
+    "from": "<发件QQ邮箱，如123456789@qq.com>",
+    "auth_code": "<QQ邮箱SMTP授权码(16位，非登录密码)>",
+    "to": ""
+  }
+}
