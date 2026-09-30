@@ -21,7 +21,8 @@ import space_watch      # ★ 2026-09-24 S16 空间龙盘中盯盘器（候选�
 #   "信号行"判定统一到 signal_rows，消除同一逻辑在 4 处各写一遍（改一处漏一处）的问题。
 #   注意：ui_common / signal_rows 内不得反向 import app —— app.py 以 __main__ 运行，
 #   被二次 import 会产生两份全局状态（TODAY_STATUS/HISTORY 不共享）。
-from ui_common import (CSS, JS, _md, _next_td, _num2, _dash, _esc_note, svg_line_chart)
+from ui_common import (CSS, JS, _md, _next_td, _num2, _dash, _esc_note, svg_line_chart,
+                       MARKET_HOLIDAYS)
 import signal_rows
 
 PORT = 8081
@@ -68,9 +69,24 @@ def log(msg):
     STATE['scan_log'] = STATE['scan_log'][-20:]
 
 
+def _is_trading_day(dt):
+    """是否【交易日】= 非周末 且 不在交易所休市日（MARKET_HOLIDAYS）。
+
+    ★2026-09-30 收口：此前代码里四处交易日判断都写 `weekday() >= 5`，只跳周末、
+      不看休市日 —— 于是国庆 10/1(周四)~10/7 会被当成正常交易日：照样拉行情、
+      跑盘中/收盘重建，并可能把休市日写进 strategy_daily（污染账本）。
+      现统一经由此函数，所有日历判断共用 ui_common.MARKET_HOLIDAYS。
+      该表按上交所休市公告维护，**每年必须人工补充下一年度**（见 ui_common 注释）。"""
+    try:
+        d = dt.date() if isinstance(dt, datetime.datetime) else dt
+        return d.weekday() < 5 and d.isoformat() not in MARKET_HOLIDAYS
+    except Exception:
+        return True      # 取不到日历时保守放行，不改变原有调度行为
+
+
 def is_trading_time(dt=None):
     dt = dt or datetime.datetime.now()
-    if dt.weekday() >= 5:
+    if not _is_trading_day(dt):
         return False
     hm = dt.hour * 60 + dt.minute
     return (9 * 60 + 30 <= hm <= 11 * 60 + 30) or (13 * 60 <= hm <= 15 * 60)
@@ -164,7 +180,7 @@ def _in_close_window(now):
     （收盘判定/收盘简报/当日记录重算/**信号对账**）只有"碰巧在 15:00:00~15:00:59 那一轮命中"
     才会执行，否则要等下次重启 boot_scan(force=True) 才补。表现为"收盘记录/简报时有时无"。
     """
-    if now.weekday() >= 5:
+    if not _is_trading_day(now):
         return False
     hm = now.hour * 60 + now.minute
     return 15 * 60 <= hm <= 16 * 60 + 30
@@ -692,7 +708,7 @@ def maybe_daily_build(force=False, now=None):
     force=True 仅用于人工/联调触发，跳过时段与去重判定。"""
     global BUILD_STATE
     now = now or datetime.datetime.now()
-    if not force and (now.weekday() >= 5 or now.hour < 15):
+    if not force and (not _is_trading_day(now) or now.hour < 15):
         return
     today = now.date().isoformat()
     if not force and (BUILD_STATE['running'] or _last_build_date() == today):
@@ -747,7 +763,7 @@ def maybe_intraday_build(realtime=None, now=None):
     am/pm 每槽每日至多一次（文件去重，跨启动生效）；与收盘 build 共用 running 锁。"""
     global BUILD_STATE
     now = now or datetime.datetime.now()
-    if now.weekday() >= 5:
+    if not _is_trading_day(now):
         return
     hm = now.hour * 60 + now.minute
     if hm >= 15 * 60:

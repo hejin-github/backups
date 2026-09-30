@@ -2233,12 +2233,19 @@ def analyze_market():
     last = sh.iloc[-1]
     asof = last['date'].strftime('%Y-%m-%d')
     out['asof'] = asof
-    # 预判目标日 = asof 之后的下一个交易日。系统无节假日表，按「周一~五」推进近似：
+    # 预判目标日 = asof 之后的下一个交易日。
     # 盘中未收盘时 asof=上一交易日 → 目标即今日；收盘后 asof=当日 → 目标为次一交易日。
-    tgt = last['date'] + pd.Timedelta(days=1)
-    while tgt.weekday() >= 5:
-        tgt += pd.Timedelta(days=1)
-    out['target'] = tgt.strftime('%Y-%m-%d')
+    # ★2026-09-30：旧实现只跳周末（注释写着"系统无节假日表"），遇黄金周会把目标日
+    #   算进休市日（10/1）。改为复用 ui_common._next_td = 周末 + MARKET_HOLIDAYS
+    #   （即上交所官方休市公告里登记的休市日），与本策略 T+1 执行日口径保持一致。
+    try:
+        from ui_common import _next_td as _ntd
+        out['target'] = _ntd(asof) or (last['date'] + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+    except Exception:      # 兜底：拿不到节假日表时退回旧的"只跳周末"近似
+        tgt = last['date'] + pd.Timedelta(days=1)
+        while tgt.weekday() >= 5:
+            tgt += pd.Timedelta(days=1)
+        out['target'] = tgt.strftime('%Y-%m-%d')
     chg = float(c.iloc[-1] / c.iloc[-2] - 1) * 100
     vr5 = float(v.iloc[-1] / sh['v5'].iloc[-1]) if pd.notna(sh['v5'].iloc[-1]) else 1.0
     ma20 = float(sh['ma20'].iloc[-1]) if pd.notna(sh['ma20'].iloc[-1]) else None
