@@ -493,13 +493,39 @@ def ensure_history():
 # _md / _next_td / _num2 / _esc_note / _nice_ticks / svg_line_chart 已移至 ui_common（见文件头 import）
 
 
+def _snapshot_unreliable(today=None):
+    """★2026-09-30：当日 RT_SNAPSHOT 是否【尚不可用于下结论】。
+
+    盘前（<9:30，含集合竞价）腾讯返回的"当日"快照是：成交量 0、今开 0、涨跌 0 ——
+    和停牌长得一模一样。旧逻辑据此判定，于是盘前刷新会把**所有**个股误判成停牌
+    （实测 09:19 首页把新华传媒标成"今日停牌"，实际只是还没开盘）；
+    daban_realtime_note 同理会把 pct=0 误读成"今日未封板 → 推荐已被证伪"。
+
+    故加此统一闸门：开盘前 / 非交易日 → 当日快照不可信，一律不下结论。
+    today 为历史日期时返回 False（历史 bar 已完整，可正常判定）。
+    """
+    try:
+        n = datetime.datetime.now()
+        t = today or n.strftime('%Y-%m-%d')
+        if t != n.strftime('%Y-%m-%d'):
+            return False                 # 历史日期：数据完整
+        if not _is_trading_day(n):
+            return True                  # 周末/节假日：无当日行情
+        return (n.hour * 60 + n.minute) < 9 * 60 + 30    # 9:30 开盘前
+    except Exception:
+        return False
+
+
 def _is_suspended_today(code, today):
     """★ 标的今日是否停牌（2026-09-10）：优先用最近一次扫描的实时快照（成交量与今开均为 0），
     无当日快照时退回本地 CSV 的今日行（成交量=0）；两处都无今日数据则返回 False（无法判定，按正常处理）。
-    用途：行动清单里"今日需卖出/买入"的标的若停牌，实际挂单会顺延到复牌日，不能照常显示。"""
+    用途：行动清单里"今日需卖出/买入"的标的若停牌，实际挂单会顺延到复牌日，不能照常显示。
+    ★2026-09-30：开盘前快照全 0 属正常（未产生成交），此时不可判停牌，见 _snapshot_unreliable。"""
     code = str(code or '')
     if not code:
         return False
+    if _snapshot_unreliable(today):
+        return False                 # 盘前/非交易日：无法判定，按正常处理
     info = (RT_SNAPSHOT or {}).get(code)
     if isinstance(info, dict) and str(info.get('date') or '') == today:
         return (info.get('volume') or 0) <= 0 and (info.get('open') or 0) <= 0
@@ -532,6 +558,8 @@ def daban_realtime_note(code, today=None):
     if not code:
         return None
     today = today or datetime.date.today().isoformat()
+    if _snapshot_unreliable(today):
+        return None                      # 盘前快照全 0（未开盘）→ 不当作"未封板"
     try:
         import space_watch
     except Exception:
@@ -3836,7 +3864,9 @@ def render_page(path='/', query=None):
     if (not _no_cache) and hit is not None and hit[0] == today:
         return hit[1]
     if path == '/watch':                      # ★ S16 空间龙盘中盯盘面板（2026-09-24）
-        body = page_frame('空间龙盘中盯盘', '/watch', render_watch(), is_trading_time())
+        body = page_frame('空间龙盘中盯盘', '/watch',
+                          render_watch((query or {}).get('date', [None])[0]),
+                          is_trading_time())
     elif path == '/s15ab':                    # ★ S15 可做窗口(gtma20)变体对照回测报告页
         body = page_frame('S15 回测对照（可做窗口 gtma20）', '/s15ab',
                           render_bt_s15(), is_trading_time())
@@ -3850,26 +3880,41 @@ def render_page(path='/', query=None):
     if not _no_cache:
         PAGE_CACHE[key] = (today, data)
     return data
-def render_watch():
+def render_watch(date=None):
     """★ 2026-09-24 S16 空间龙【盘中盯盘面板】。
 
     展示：候选池（今日潜在空间龙前 5）、全天盯过的票的封板/炸板轨迹、14:57 收盘确认结果。
     数据源 = app.do_scan 每轮驱动的 space_watch.tick()（跨重启从 json 恢复）。
+
+    ★2026-09-30：支持 ?date=YYYY-MM-DD 翻历史存档（只读）。
+    历史日走 space_watch.read_archive()——**绝不可**用 load()（它会把历史状态写回
+    STATE，覆盖掉今日盯盘进度）。
     """
+    _today_s = datetime.date.today().isoformat()
+    date = str(date or '').strip() or None
+    _hist = bool(date) and date != _today_s
     try:
-        if not (space_watch.STATE.get('date') and space_watch.STATE.get('ticks')):
-            space_watch.load_today()
-        # ★ ready / prev_date 只在 tick() 里赋值，盘前或非交易时段一次都还没 tick，
-        #   页面会误报"底表尚未就绪"（实测：日志已打印构建完成 68s，页面却说未就绪）。
-        #   这里主动探测一次——底表已由启动线程预热，命中缓存立即返回，不会重跑 68s。
-        if not space_watch.STATE.get('ready'):
-            _pv = space_watch.ensure_prev()
-            if _pv:
-                space_watch.STATE['ready'] = True
-                space_watch.STATE['prev_date'] = _pv.get('date')
-        if not space_watch.STATE.get('date'):
-            space_watch.STATE['date'] = datetime.date.today().isoformat()
-        snap = space_watch.snapshot()
+        if _hist:
+            snap = space_watch.read_archive(date)
+            if not snap:
+                return ('<div class="card"><h2>空间龙盘中盯盘</h2>'
+                        f'<p class="muted">没有 <b>{html.escape(date)}</b> 的盯盘存档'
+                        '（盯盘从 2026-09-24 起才有按日落盘）。</p>'
+                        '<p><a href="/watch">← 回到今日实时盯盘</a></p></div>')
+        else:
+            if not (space_watch.STATE.get('date') and space_watch.STATE.get('ticks')):
+                space_watch.load_today()
+            # ★ ready / prev_date 只在 tick() 里赋值，盘前或非交易时段一次都还没 tick，
+            #   页面会误报"底表尚未就绪"（实测：日志已打印构建完成 68s，页面却说未就绪）。
+            #   这里主动探测一次——底表已由启动线程预热，命中缓存立即返回，不会重跑 68s。
+            if not space_watch.STATE.get('ready'):
+                _pv = space_watch.ensure_prev()
+                if _pv:
+                    space_watch.STATE['ready'] = True
+                    space_watch.STATE['prev_date'] = _pv.get('date')
+            if not space_watch.STATE.get('date'):
+                space_watch.STATE['date'] = _today_s
+            snap = space_watch.snapshot()
     except Exception as e:
         return (f'<div class="card"><h2>空间龙盘中盯盘</h2>'
                 f'<p class="muted">状态读取失败：{html.escape(str(e))}</p></div>')
@@ -3913,6 +3958,26 @@ def render_watch():
         '.then(function(j){setTimeout(function(){location.reload();},30000)})'
         '.catch(function(e){m.innerText="请求失败，请重试";b.disabled=false;'
         'b.innerText="刷新盯盘数据"});}</script>' % _swr_state)
+    # ★ 2026-09-30：盯盘日期切换（今日实时 / 历史存档只读）
+    _dates = list(space_watch.archive_dates() or [])
+    if _today_s not in _dates:
+        _dates.append(_today_s)
+    _opts = ''
+    for _x in sorted(set(_dates), reverse=True):
+        _lab = _x + ('  ← 今天（实时盯盘）' if _x == _today_s else '  （历史存档）')
+        _sel = ' selected' if _x == (date or _today_s) else ''
+        _opts += f'<option value="{esc(_x)}"{_sel}>{esc(_lab)}</option>'
+    h += ('<div class="card"><h3>盯盘日期</h3>'
+          '<p class="muted">切换任意盯盘日：今日为实时盯盘；历史日期取当日存档快照'
+          '<b>只读</b>，不会改动今日任何盯盘状态。</p>'
+          '<p><select onchange="if(this.value)location.href=\'/watch?date=\'+this.value" '
+          f'style="padding:6px;font-size:14px">{_opts}</select></p></div>')
+    if _hist:
+        h += ('<div class="card" style="border-left:4px solid #e8a33d">'
+              '<h3>⚠ 正在查看历史存档（只读）</h3>'
+              f'<p class="muted"><b>{esc(date)}</b> 是当日盯盘结束后的快照，不再更新。'
+              ' <a href="/watch">← 回到今日实时盯盘</a></p></div>')
+
     _stale = snap.get('stale')
     _qd = snap.get('quote_date')
     st = ('<div class="card"><h3>盯盘状态</h3>'
@@ -3921,7 +3986,7 @@ def render_watch():
           f'行情日期：<b>{esc(_qd or "-")}</b> ｜ '
           f'已盯 <b>{int(snap.get("ticks") or 0)}</b> 轮 ｜ '
           f'轨迹票 <b>{len(snap.get("seen") or {})}</b> 只</p>'
-          + _swr_html
+          + ('' if _hist else _swr_html)   # 历史存档页不显示"刷新盯盘"（刷新的是今日）
           + ('<p class="note"><b>今日休市（或无实时行情）</b>：行情日期为 '
              f'{esc(_qd or "-")}，与盯盘日不一致 → 已拒绝用陈旧快照更新候选池和收盘确认，'
              '避免把上一交易日的涨停票误判成今日封板。</p>' if _stale else '')
@@ -3995,7 +4060,7 @@ def render_watch():
     else:
         import datetime as _dt
         _hm = _dt.datetime.now().hour * 60 + _dt.datetime.now().minute
-        if _hm >= space_watch.CONFIRM_HM:
+        if _hist or _hm >= space_watch.CONFIRM_HM:   # 历史存档：不看当前时刻，直接给当日结论
             h += ('<div class="card"><h3>14:57 收盘确认</h3>'
                   f'<p class="muted">{esc(space_watch.confirm_text(snap))}</p></div>')
 

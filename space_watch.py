@@ -391,8 +391,10 @@ def load(d=None):
     try:
         with open(p, encoding='utf-8') as f:
             obj = json.load(f)
-        for k in ('date', 'prev_date', 'ready', 'ticks', 'pool', 'seen',
-                  'tracks', 'confirmed', 'final', 'log'):
+        # quote_date / stale 2026-09-30 补上：缺了它们，重启恢复后页面"行情日期"显示
+        # 成 -、也无法判定"今日休市（拒绝用陈旧快照）"，直到下一次 tick 才有值。
+        for k in ('date', 'prev_date', 'quote_date', 'stale', 'ready', 'ticks',
+                  'pool', 'seen', 'tracks', 'confirmed', 'final', 'log'):
             if k in obj:
                 STATE[k] = obj[k]
         return snapshot()
@@ -407,6 +409,46 @@ def load_today(now=None):
     if STATE.get('date') == d and STATE.get('ticks'):
         return snapshot()
     return load(d)
+
+
+def archive_dates():
+    """★2026-09-30：列出所有历史盯盘存档的日期（升序），供页面下拉切换。"""
+    try:
+        if not os.path.isdir(WATCH_DIR):
+            return []
+        suf = '.json'
+        pre = 'space_watch_'
+        return sorted(fn[len(pre):-len(suf)]
+                      for fn in os.listdir(WATCH_DIR)
+                      if fn.startswith(pre) and fn.endswith(suf))
+    except Exception:
+        return []
+
+
+def read_archive(d):
+    """★2026-09-30：只读地取回某日的盯盘存档（页面翻旧账用）。
+
+    与 load() 的根本区别：load() 会把读到的内容【写回 STATE】——那是服务重启后
+    恢复当日进度用的。若在页面渲染历史时调用 load()，今日 STATE 的 date/pool/
+    seen/confirmed 会被历史覆盖，直接毁掉当日盯盘（候选池和 14:57 确认全错）。
+    本函数只读文件、绝不触碰 STATE。"""
+    p = _file(d)
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, encoding='utf-8') as f:
+            obj = json.load(f)
+    except Exception as e:
+        _log('存档读取失败: %s' % str(e)[:60])
+        return None
+    if not isinstance(obj, dict):
+        return None
+    snap = {k: obj.get(k) for k in ('date', 'prev_date', 'quote_date', 'ready',
+                                    'ticks', 'pool', 'seen', 'tracks',
+                                    'confirmed', 'final', 'log', 'stale')}
+    snap['date'] = obj.get('date') or d
+    snap['archived'] = True
+    return snap
 
 
 # ---------- 给页面看的文案 ----------
