@@ -24,13 +24,20 @@ D:\codebuddy_workspace\
 │   ├── history_engine.py     # 后台回放引擎（逐日模拟，生成 strategy_daily.json）
 │   ├── advisor.py            # 推荐引擎（个股评分/买卖点 + 指数估值判断 + 实时数据补齐）
 │   ├── backtest.py           # 底层：股票池、指标计算、买卖信号函数、费用模型
-│   ├── check_engine.py       # 引擎自检脚本（开发用）
-│   ├── probe_*.py            # 临时探测脚本（排障后应清理）
-│   ├── start.bat             # 启动脚本
-│   └── PROJECT_CONTEXT.md    # 本文档
-└── data\                     # 数据目录（工作区根，与 stock_bot 平级）
-    ├── csv\                  # 个股日线 CSV + 指数估值 CSV（hs300_pe.csv / hsly_pb.csv）+ sh000001.csv（上证指数日线，买入过滤器用）
-    └── strategy_daily.json   # 引擎输出（10 策略，含 daily + trades + summary）
+│   ├── notify.py            # 多通道推送（qywx/dingtalk/feishu/serverchan/qmail：盘中信号、收盘简报、告警）
+│   ├── space_watch.py       # S16 空间龙盘中盯盘器（候选池/炸板轨迹/14:57 收盘确认）
+│   ├── review.py            # ★2026-10-08 收盘复盘（大盘/量价/情绪/估值/持仓/卖出/明日行动 → 供收盘简报）
+│   ├── signal_rows.py       # 信号行渲染（页面与推送共用同一判定）
+│   ├── signal_store.py      # 盘中信号 SQLite 存储（data/signals.db）
+│   ├── check_engine.py      # 引擎自检脚本（开发用）
+│   ├── probe_*.py           # 临时探测脚本（排障后应清理）
+│   ├── start.bat            # 启动脚本
+│   └── PROJECT_CONTEXT.md   # 本文档
+└── data\                    # 数据目录（工作区根，与 stock_bot 平级）
+    ├── csv\                 # 个股日线 CSV + 指数估值 CSV（hs300_pe.csv / hsly_pb.csv）+ sh000001.csv（上证指数日线，买入过滤器用）
+    ├── strategy_daily.json  # 引擎输出（13 策略，含 daily + trades + summary）
+    ├── review_history.json  # ★复盘每日核心指标累积（成交额/涨停/跌停），供次日复盘做环比，留最近 120 天
+    └── review_notes\        # ★人工维护的消息面要点：{YYYY-MM-DD.md}（或 _default.md），收盘简报自动带上
 ```
 
 > 注意：`app.py` 通过 `os.path.dirname(os.path.dirname(os.path.abspath(__file__)))` 得到工作区根，并 `os.chdir(WORKSPACE)`，因此所有 `data/...` 相对路径都指向 `D:\codebuddy_workspace\data`。
@@ -286,6 +293,107 @@ copy /Y 到 D:\codebuddy_workspace\backup_YYYYMMDD_HHMMSS\  （含 stock_bot + d
 :: 验证
 浏览器打开 http://127.0.0.1:8080
 ```
+
+---
+
+## 11. 收盘简报 · 复盘模块 review.py（2026-10-08）
+
+### 11.1 改动要点
+1. 新增 `stock_bot/review.py`：`build_review()` 产出复盘 dict → `render_md()` 渲染成 Markdown 文本。
+2. `notify.send_close_brief(..., review=...)` 新增 `review` 参数（dict 或已渲染文本），作为「## 🔍 今日复盘」插在简报最前面；**有复盘时自动省略「各策略今日状态」**（已被持仓复盘 + 明日行动覆盖，不重复）。
+3. `app.py` 收盘段**顺序调整**（关键）：原来是「发简报 → maybe_daily_build」，复盘读的是上一交易日账本。
+   现改为：`intraday_reconcile_close` → `maybe_daily_build` → `_close_brief_after_build()`（后台线程等 build 结束再发）。
+4. `maybe_daily_build`：`BUILD_STATE['running'] = True` **在起线程之前**置位（原来放在 `_do()` 第一行），
+   否则 `_close_brief_after_build` 读到的仍是 False，会拿着旧账本抢先发。等待上限 `CLOSE_BRIEF_WAIT_MAX = 900s`，超时按现有账本发，不让简报凭空消失。
+
+### 11.2 复盘包含哪些口径
+| 块 | 口径 | 数据源 |
+|---|---|---|
+| 大盘 | 上证/深成指/创业板 收盘与涨跌 | 腾讯指数实时 1 次请求；失败降级 `data/csv/sh000001.csv` |
+| 量价 | 沪深主板成交额（含环比）、涨跌家数、个股涨幅中位数 | 当日实时快照（2614 只，仅沪深主板，不含创业板/科创/北交所）+ `review_history.json` 昨日值 |
+| 情绪 | 涨停/跌停/炸板/封板率、连板梯队与最高板、昨日涨停晋级率与打板溢价 | 实时快照 + `backtest._S16_LEADERS_CACHE['by_date']` 连板底表 |
+| 估值 | 沪深300 PE、中证红利 PB 及近 3 年分位 | `data/csv/hs300_pe.csv` / `hsly_pb.csv` |
+| 消息面 | 人工维护 | `data/review_notes/{date}.md`（缺省 `_default.md`），无则显式标注"—"，**不假装有新闻源** |
+| 持仓复盘 | 每策略：标的、成本、现价、浮盈%、当日涨跌、持有天数 | `strategy_daily.json` 当日行 + 实时快照 |
+| 今日卖出 | 每笔：买入日/价 → 卖出价、收益率、净盈亏、持有天数、卖出原因（sell_tag） | 各策略 `trades` 里 `sell_date == 当日` |
+| 明日行动 | 买入（含参考价与执行时点）/ 卖出 / 卖出后换仓候选 | 当日行 `status ∈ 买入信号 / 卖出信号 / 卖出顺延` + `rec_buy` |
+| 情绪评分 | 0~100 = 封板率 50% + 上涨占比 30% + 晋级率 20% → 冰点/低迷/偏弱/温和/活跃/亢奋 | 同上三项 |
+
+### 11.3 必须守住的三条护栏
+- **行情新鲜度闸门**：实时快照的最早/最新日期 ≠ 复盘日 → 直接跳过整段复盘（休市日腾讯返回的是上一交易日收盘快照，
+  据此统计涨停/情绪会得出错误的"今日"结论，2026-09-25 中秋踩过）。
+- **账本日期校验**：`account_review` 只认 `daily[-1].date == date` 的行；账本未滚到当日就**不猜、不显示**（宁缺勿错）。
+- **★★ 明日行动必须有两个来源，缺一必漏**（2026-10-08 用户当场反馈「邮件里没有 S16 空间龙盯盘的传艺科技」）：
+  ① `strategy_daily.json` 当日行（有独立账本的策略）；
+  ② **今日信号库 `data/signals.db`**（app 传入 `sig_rows=_intraday_sig_rows()`，与首页「今日行动清单」同源）。
+  原因：**S16_空间龙盯盘只有盯盘+决策+落信号库，没有独立策略账本**（见 11.6），只扫账本会整条漏掉它。
+  去重沿用首页口径：该策略当日账本行已是同一标的的 `买入信号/买入信号(待成交)` → 跳过；
+  已由账本生成的同 (sname, code) → 跳过。来源 ② 的行渲染时标注
+  「（今日收盘确认 → 明日执行）」，若账本当日判定不是买入信号，再补「注：本条出自今日信号，收盘账本当日判定为「空仓」」
+  ——不掩饰两处口径不一致（实测 10/8 S9 中国天楹：信号库存、账本判空仓）。
+
+### 11.4 已踩的坑（改这个模块前先看）
+1. **`bt._S16_LEADERS_CACHE['by_date']` 的 key 是 `pd.Timestamp` 不是字符串** —— `bd.get('2026-10-08')` 恒为 None 且**不报错**，
+   表现为「连板/梯队/晋级率全空」。review 里用 `_lb_key_map()` 做 `str(k)[:10] → 原 key` 映射后再取。
+2. **炸板判定必须排除收盘仍封板的**：原写法只看 `high >= 涨停价×0.995`，会把「回封」的票也算炸板（实测 10/8 炸板 64 → 修后 33）。判据 = 收盘未涨停 **且** 盘中触及涨停价。
+3. 今日连板若底表还没有当日数据（bar 未写回），回退用「昨日连板 + 1」估算，首板记 1，标记 `estimated`。
+4. ST 股涨停阈值是 5%（`_limit_thr` 按名称含 ST 判定），否则一片 5% 涨停会被算成炸板。
+
+### 11.5 手工补发
+昨天/今天的简报已按旧格式发出时，可用 `c:/Users/hejin/CodeBuddy/20260819154435/_brief_resend.py --yes` 补发一封含复盘的版本。
+**铁律：补发一律走 `notify.send()` 直发，不写 `data/notify_brief_sent.json`**，否则会把它当天后续/次日的正式推送拦掉。
+
+### 11.6 复盘/简报覆盖不到的策略（改动前先确认是不是这类）
+- **S16_空间龙盯盘**（space_watch.py）：**没有独立策略账本**，只在 `data/space_watch_{date}.json` 存当日盯盘轨迹
+  与 14:57 确认决策，并把它当一条盘中 Signal 写入信号库（sname=`S16_空间龙盯盘`）。
+  因此它不出现在 `strategy_daily.json` 的 13 个策略里 —— 任何**只扫账本**的逻辑（持仓复盘、总账、明细、
+  收益统计、收盘简报的明日行动）都会漏掉它，必须显式从信号库补（见 11.3 第 3 条）。
+  若要让它有模拟持仓，属"开独立策略 S17"的上线动作，需用户确认（2026-09-28 提出，尚未动）。
+
+### 11.7 盘中信号 vs 收盘账本：收盘对账（2026-10-09 修复）
+
+**症状**：10/08 首页/邮件写「S9 中国天楹 000035 今日收盘触发 → 10/09 执行」，但当日账本判「空仓」。
+**根因**：`intraday_rows` 在 15:00 后**无条件**宣称"今日收盘已确认"。盘中触发用的是实时价拼的伪 bar
+（冲高时"创 20 日新高"成立、收盘回落后即不成立），收盘用真实收盘价重判后常常并不触发，两处口径因此打架。
+
+**修复（四处同源消费方一起改，口径统一）**：
+1. `signal_rows.intraday_rows(..., ledger=None)` 新增 `ledger`（策略全名 → 当日账本行）：
+   - 仅当**收盘后（hour≥15）且当日账本行已落地**才对账；`triggered=True` 或 status ∈
+     (买入信号/买入信号(待成交)/建仓/换仓买入/买入成交) 视为已确认。
+   - 未确认 → 行标记 `_confirmed=False` + `_ledger_status`，tag 改「收盘未确认」，note 写
+     "收盘用真实收盘价重判未成立…本条不执行，仅留痕"。
+   - **账本没滚到当日 / 策略本就无账本（空间龙盯盘）→ `_confirmed=None`，行为完全不变**，绝不误杀。
+2. `app._today_ledger_map()`：内存 `HISTORY` 为 None 时（服务刚启动还没 scan/build）**读文件兜底**
+   并按 (日期, mtime) 缓存 —— 否则对账会静默失效且无报错。
+3. `app.py` 今日行动清单：`_confirmed is False` → 灰色「收盘未成立、不执行」提示（不再是"待执行"橙条）；
+   总账/速览表该行 state 改「未成立」、remark 与 tag 同步（remark 会被 escape，**别写 HTML 标签**）。
+4. `review.py`：`_confirmed is False` 不进「明日行动」，改记 `unconfirmed`，render 里单列一行
+   "盘中触发·收盘未成立（不执行，仅留痕）"，说明它为何消失。
+
+**护栏**：只有账本当日行存在才敢证伪；盘中/无账本策略一律不判。`ledger` 不传 = 旧行为（向后兼容）。
+
+### 11.8 盘中信号推送：稳定后再发（2026-10-09）
+
+**需求**：用户反馈"盘中触发的邮件，信号随后就消失了" → 改为**连续 N 轮扫描仍在触发才发邮件**
+（`notify.INTRADAY_STREAK_MIN = 2`，扫描周期 `app.SCAN_SECONDS=300`，即约 5~10 分钟）。
+用户明确选择**不做 Top5 排名筛选**（只要稳定就发）。
+
+**实现（notify.py）**
+- `_STREAK = {(trade_date, sname, code): 连续轮数}` 进程内计数；`_streak_bump` 每轮触发 +1
+  （并清掉同策略其它标的 = 已换标的/gone），`_streak_reset` 在未触发时清零（由
+  `intraday_signal_clear` 调用）。
+- `send_intraday_signal(rec, sname, require_streak=True)`：顺序仍是**先落库、再判推送**
+  （留痕与推送解耦，/signals 历史始终完整）→ 计数 → `enabled()` → `pushed` 去重 → 轮数达标才发。
+- 邮件正文新增稳定性说明："已连续 N 轮扫描持续触发，自 HH:MM 起"。
+- **服务重启计数归零** → 当天首条推迟一轮再发（宁可晚发/不发，也不发一条马上消失的信号）。
+
+**例外：必须 `require_streak=False`**
+- `space_watch` 14:57 收盘确认封板买入（app.py:299）—— 一天只确认一次、不存在"下一轮还在不在"，
+  按轮数卡会**直接漏发**。同理，任何"确定性决策"型推送都要显式传 False。
+
+**护栏**
+- 中途消失 → 计数清零 → **永不补发**（pushed 也只在真发时置位）。
+- 收盘后（非 trading）本就不走盘中推送，改由收盘简报/收盘对账（11.7）承载。
 
 ---
 

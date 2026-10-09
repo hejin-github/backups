@@ -294,7 +294,9 @@ def _space_watch_tick(rt, now):
                         '' if not _sk else '；跳过：' + '；'.join(_sk))),
             'trigger_time': '%s %s' % (c.get('date'), c.get('at')),
         }
-        notify.send_intraday_signal(rec, space_watch.SNAME)
+        # require_streak=False：14:57 收盘确认是**确定性决策**（一天只确认一次，不存在
+        # "下一轮还在不在"），若按盘中稳定轮数卡会直接漏发。
+        notify.send_intraday_signal(rec, space_watch.SNAME, require_streak=False)
         log(f"空间龙盯盘确认买入 {c.get('name')}({c.get('code')}) "
             f"{c.get('lb')}板 @{_px}")
     except Exception as e:
@@ -416,8 +418,6 @@ def do_scan(force=False):
                 _m = history_engine.analyze_market()
                 # ★ 收盘后刷新统一今日状态（页面提醒卡 / 微信推送同一数据源）
                 update_today_status(rec=STATE['recommend'], sname=sname, market=_m)
-                notify.send_close_brief(market=_m, rec=STATE['recommend'],
-                                        sname=sname, hist=HISTORY)
                 notify.send_market_alert(_m)
                 # ★ 2026-09-17 收盘对账：把当日盘中信号统一到**收盘判定**口径。
                 #   9/16 S15 盘中最后一刻换成高新发展，但收盘判定（daily 9/16 行）是方大集团、
@@ -427,7 +427,10 @@ def do_scan(force=False):
                 if _rc:
                     log(f'收盘信号对账：[{sname}] {_rc} 条按收盘判定更新状态')
                 # ★ 收盘后每日一次后台重建当日记录（完成后重载数据 + 页面自动刷新）
+                #   ★2026-10-08：必须**先于**收盘简报触发 —— 简报里的复盘
+                #   （持仓/当日卖出/明日行动）读的是当日账本，先发简报则全是上一交易日口径。
                 maybe_daily_build()
+                _close_brief_after_build(_today_s, sname, _m)
                 STATE['close_scan_date'] = _today_s
             except Exception as e:
                 log(f'收盘推送失败: {str(e)[:60]}')
@@ -744,7 +747,6 @@ def maybe_daily_build(force=False, now=None):
 
     def _do():
         global HISTORY, PAGE_CACHE
-        BUILD_STATE['running'] = True
         try:
             log('收盘后自动重建当日记录：后台开始计算（约30-60秒）...')
             import history_engine
@@ -760,7 +762,61 @@ def maybe_daily_build(force=False, now=None):
         finally:
             BUILD_STATE['running'] = False
 
+    # ★2026-10-08：running 置位必须在起线程**之前**（原来放在 _do 里第一行）。
+    #   收盘简报线程据此判断"账本是否已就绪"，若这里还没置位就被读到 False，
+    #   会拿着旧账本抢先发出简报，复盘里的持仓/卖出全是上一个交易日的口径。
+    BUILD_STATE['running'] = True
     threading.Thread(target=_do, daemon=True).start()
+
+
+CLOSE_BRIEF_WAIT_MAX = 900      # 收盘简报等待账本重建的上限（秒）；超时则按现有账本发
+_BRIEF_SENT_FLAG = {'date': None}   # 避免同一天重复起等待线程（do_scan 已有 close_scan_date 兜底）
+
+
+def _close_brief_after_build(date_s, sname, market):
+    """★2026-10-08：收盘简报改为「当日账本重建完成后」再发。
+
+    背景：原顺序是「先发简报 → 再 maybe_daily_build」，于是简报里的持仓/卖出/明日行动
+    永远是**上一交易日**的口径（实测 10/8 简报里看不到当日 S16 深物业A 的断板卖出）。
+    这里起后台线程等 BUILD_STATE['running'] 落下后再：
+      重载 HISTORY → review.build_review（大盘/量价/情绪/持仓/卖出/行动）→ 推送。
+    等待有上限（CLOSE_BRIEF_WAIT_MAX），超时就用现有账本发，不让简报凭空消失。
+    """
+    if _BRIEF_SENT_FLAG['date'] == date_s:
+        return
+    _BRIEF_SENT_FLAG['date'] = date_s
+
+    def _run():
+        global HISTORY
+        t0 = time.time()
+        while BUILD_STATE['running'] and time.time() - t0 < CLOSE_BRIEF_WAIT_MAX:
+            time.sleep(5)
+        if BUILD_STATE['running']:
+            log('收盘账本重建超时（>%ds），简报按现有账本发出' % CLOSE_BRIEF_WAIT_MAX)
+        try:
+            HISTORY = json.load(open(HISTORY_FILE, encoding='utf-8'))
+        except Exception as e:
+            log('账本重载失败（沿用内存数据）: %s' % str(e)[:60])
+        rv = {}
+        try:
+            # sig_rows 必须传：与首页「今日行动清单」同源的空间龙盯盘行只在信号库里，
+            # 复盘自己查不到 S16_空间龙盯盘这种"只有盯盘决策、没有独立账本"的策略。
+            try:
+                _sig = _intraday_sig_rows()
+            except Exception:
+                _sig = []
+            import review
+            rv = review.build_review(date=date_s, realtime=dict(RT_SNAPSHOT),
+                                     hist=HISTORY, sig_rows=_sig)
+        except Exception as e:
+            log('复盘生成失败: %s' % str(e)[:80])
+        try:
+            notify.send_close_brief(market=market, rec=STATE['recommend'],
+                                    sname=sname, hist=HISTORY, review=rv)
+        except Exception as e:
+            log('收盘简报推送失败: %s' % str(e)[:80])
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def _last_intra_slot():
@@ -1724,9 +1780,13 @@ def _sl_ledger_rows():
                 'date': _d0, 'b_date': _d0, 'b_px': _r.get('price'),
                 'a_date': None, 'a_px': None, 'b2_date': None, 'b2_px': None,
                 'cycle': None, 'entry_type': '买入信号', 'active': True,
-                'state': '待执行', 'intraday': True,
+                # ★ 2026-10-08 收盘对账：False=收盘用真实收盘价重判未成立 → 不是"待执行"
+                'state': ('未成立' if _r.get('_confirmed') is False else '待执行'),
+                'intraday': True,
                 'sig_price': _r.get('price'), 'sig_score': _r.get('score'),
                 'sig_tag': None, 'intraday_note': _r.get('note'),
+                'intraday_confirmed': _r.get('_confirmed'),
+                'intraday_ledger_status': _r.get('_ledger_status'),
             })
     except Exception:
         pass
@@ -1811,7 +1871,14 @@ def _sl_ledger_row(r):
         # ★ 2026-09-10 盘中实时触发行：价格=盘中现价，收盘确认后按信号日收盘价更新
         _sp, _ss = r.get('sig_price'), r.get('sig_score')
         _cl = datetime.datetime.now().hour >= 15   # ★ 2026-09-10：收盘后不再用"盘中价/待确认"口径
-        if _cl:
+        if _cl and r.get('intraday_confirmed') is False:
+            # ★ 2026-10-08 收盘对账：盘中冲高触发、收盘用真实收盘价重判后不成立 → 留痕不执行
+            #   （remark 会被 html.escape，这里不要写 HTML 标签）
+            remark = (f"盘中曾触发（{r.get('date')} 盘中价 {_sp if _sp is not None else '—'}，"
+                      f"评分 {_ss if _ss is not None else '—'}）："
+                      f"收盘用真实收盘价重判未成立（当日账本判定"
+                      f"{r.get('intraday_ledger_status') or '未触发'}），本行不执行、仅留痕")
+        elif _cl:
             remark = (f"今日收盘已确认（{r.get('date')} 收盘价 {_sp if _sp is not None else '—'}，"
                       f"评分 {_ss if _ss is not None else '—'}"
                       + (f"，{r.get('sig_tag')}" if r.get('sig_tag') else '')
@@ -1856,7 +1923,7 @@ def _sl_ledger_row(r):
         f'<tr><td class="note">{slink}</td>'
         f'<td><b class="st {tcls}">{html.escape(tlab)}</b>'
         f'{("<span class=muted>（登记）</span>") if r["type"] == "卖出信号" else ""}'
-        f'{("<span class=muted>（" + ("收盘确认" if datetime.datetime.now().hour >= 15 else "盘中触发") + "）</span>") if r.get("intraday") else ""}</td>'
+        f'{("<span class=muted>（" + ("收盘未确认" if r.get("intraday_confirmed") is False else ("收盘确认" if datetime.datetime.now().hour >= 15 else "盘中触发")) + "）</span>") if r.get("intraday") else ""}</td>'
         f'<td><b>{html.escape(str(r["name"]))}</b>{code_html}</td>'
         f'<td>{html.escape(str(b_date or "—"))}</td>'
         f'<td>{b_px if b_px is not None else "—"}</td>'
@@ -2138,6 +2205,46 @@ def _intraday_sig_row(sid=None):
     return signal_rows._intraday_row_from_ts(TODAY_STATUS, sid)
 
 
+_LEDGER_CACHE = {'sig': None, 'val': {}}
+
+
+def _today_ledger_map(today=None):
+    """今日账本行按策略名索引 → 供盘中信号做**收盘对账**（signal_rows.intraday_rows 的 ledger）。
+
+    只有 daily[-1].date == 今天 才算收盘 build 已落地（判定权威）；未落地（盘中 / 还没 build）
+    返回空 dict —— 调用方据此不做任何证伪，避免把正常待执行信号误杀。
+
+    ★ 数据源：优先内存里的 HISTORY；但它在**服务刚启动、还没跑过 scan/build 时是 None**
+      （app.py:54，只在扫描/build 流程里赋值），此时直接读文件兜底 —— 否则对账会因为
+      取不到数据而**静默失效**（返回空 dict 且无任何报错）。结果按 (日期, 文件 mtime) 缓存。
+    """
+    today = today or datetime.date.today().isoformat()
+    _mem = HISTORY if isinstance(HISTORY, dict) and (HISTORY.get('strategies') or []) else None
+    if _mem is not None:
+        sig = ('mem', today, len(_mem.get('strategies') or []))
+    else:
+        try:
+            sig = ('file', today, os.path.getmtime(HISTORY_FILE))
+        except Exception:
+            sig = ('file', today, 0)
+    if _LEDGER_CACHE['sig'] == sig:
+        return _LEDGER_CACHE['val']
+    strategies = (_mem or {}).get('strategies') or []
+    if not strategies:
+        try:
+            with open(HISTORY_FILE, encoding='utf-8') as f:
+                strategies = (json.load(f) or {}).get('strategies') or []
+        except Exception:
+            strategies = []
+    out = {}
+    for s in strategies:
+        daily = s.get('daily') or []
+        if daily and str(daily[-1].get('date') or '') == today:
+            out[str(s.get('name') or '')] = daily[-1]
+    _LEDGER_CACHE['sig'], _LEDGER_CACHE['val'] = sig, out
+    return out
+
+
 def _intraday_sig_rows(sid=None, include_gone=False):
     """当日**全部**盘中触发信号（SQLite 信号库 data/signals.db，跨重启持久化）→ 页面伪行列表。
 
@@ -2148,8 +2255,13 @@ def _intraday_sig_rows(sid=None, include_gone=False):
     ★ 2026-09-17：默认 include_gone=False —— 本函数的消费方（首页信号登记 / 总账 / 速览表 /
       每日选股 / 今日行动清单 / 详情页提示条）都是"**待执行信号**"口径，已消失的行不属于
       待执行信号（9/16 S15 曾把"高新发展（已消失）"当买入信号置顶，与收盘判定方大集团矛盾）。
-      /signals 页直读 notify.intraday_signals_history，不受此参数影响。"""
-    return signal_rows.intraday_rows(TODAY_STATUS, sid, include_gone=include_gone)
+      /signals 页直读 notify.intraday_signals_history，不受此参数影响。
+    ★ 2026-10-08：传入 ledger 做收盘对账 —— 收盘后若该策略当日账本判定并未触发
+      （10/08 S9 中国天楹：盘中冲高触发、收盘回落不成立，账本判"空仓"），行会被标记
+      `_confirmed=False`，下游不再宣称"明日执行"。同源消费方（首页行动清单/总账/速览/
+      详情页/收盘复盘）因此口径一致。"""
+    return signal_rows.intraday_rows(TODAY_STATUS, sid, include_gone=include_gone,
+                                     ledger=_today_ledger_map())
 
 
 def render_signals(query=None):
@@ -3571,6 +3683,18 @@ def today_action_card():
                 continue
             _rsid = _rot.split('_')[0]
             _rshort = html.escape(_rot.split('_', 1)[1]) if '_' in _rot else ''
+            # ★ 2026-10-08 收盘对账：收盘已用真实收盘价重判、该标的并不成立 → 只留痕，
+            #   不再宣称"明日执行"（此前 S9 中国天楹盘中冲高触发、收盘回落不成立，
+            #   首页却写"已按收盘价确认…10/09 执行"，与当日账本"空仓"直接打架）
+            if _r.get('_confirmed') is False:
+                rot_sig += (f'<p class="st gray">⚪ {_md(today)}盘中曾触发：'
+                            f'<b>{_rsid} {_rshort}</b> {html.escape(str(_r.get("name") or ""))}'
+                            f'（{html.escape(str(_r.get("code") or ""))}）'
+                            f'{_r.get("price", "—")} 评分 {_r.get("score", "—")} —— '
+                            f'收盘用真实收盘价重判<b>未成立</b>（当日账本判定：'
+                            f'{html.escape(str(_r.get("_ledger_status") or "未触发"))}），'
+                            f'本条<b>不执行</b>，仅留痕。</p>')
+                continue
             rot_sig += (f'<p class="st warn">⚠️ {_md(today)}'
                         f'{"收盘触发" if _closed_td else "盘中触发"}（{_md(ex)}执行，勿提前操作）：'
                         f'<b>{_rsid} {_rshort}</b> {html.escape(str(_r.get("name") or ""))}'

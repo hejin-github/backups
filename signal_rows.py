@@ -112,7 +112,8 @@ def _intraday_row_from_ts(ts, sid=None):
             'note': _note}
 
 
-def intraday_rows(ts, sid=None, evs=None, include_gone=False, include_watch=False):
+def intraday_rows(ts, sid=None, evs=None, include_gone=False, include_watch=False,
+                  ledger=None):
     """当日**全部**盘中触发信号 → 行对象列表。
 
     数据源：notify 的 SQLite 信号库（data/signals.db，跨重启持久化）；库为空时回退
@@ -128,6 +129,15 @@ def intraday_rows(ts, sid=None, evs=None, include_gone=False, include_watch=Fals
     ★ 2026-09-18 新增 include_watch，默认 **False**：**持仓跟踪**行（watch=1，轮值外策略对
       自己持仓股的盘中窄扫描留痕）不是买入信号——它只是"推荐的下文"，不该进待执行信号口径。
       持仓跟踪只在 /signals 页展示（含 T+1/T+3/T+5 前向表现）。
+
+    ★ 2026-10-08 新增 ledger（策略全名 → 当日账本行 dict）用于**收盘对账**：
+      15:00 后本函数原本**无条件**宣称"今日收盘已确认"，但盘中触发用的是实时价拼的伪 bar
+      （当日冲高时"创 20 日新高"成立、收盘回落后即不成立），收盘用真实收盘价重判后常常
+      **并不触发**；于是出现"首页/邮件说今日收盘触发明日买入、收盘账本却判空仓"的自相矛盾
+      （10/08 S9 中国天楹 000035 正是如此）。现在：仅在**当日账本行已落地**（说明收盘
+      build 完成、判定权威）时做对账，若该策略当日未触发则行标记 `_confirmed=False`，
+      由下游（今日行动清单 / 收盘复盘）降级为"仅留痕、不执行"。
+      账本未滚到当日（盘中、或策略本就无账本如空间龙盯盘）→ 不做任何证伪，维持原行为。
     """
     if evs is None:
         try:
@@ -141,6 +151,8 @@ def intraday_rows(ts, sid=None, evs=None, include_gone=False, include_watch=Fals
     d0 = datetime.date.today().isoformat()
     ex = _next_td(d0)
     _cl = datetime.datetime.now().hour >= 15   # ★ 2026-09-10 收盘后改用"已确认"口径
+    # 收盘后被视为"已确认"的账本状态（其余一律算未确认）
+    _CONFIRM_ST = ('买入信号', '买入信号(待成交)', '建仓', '换仓买入', '买入成交')
     out = []
     for e in evs:
         nm = str(e.get('name') or '').strip()
@@ -155,10 +167,21 @@ def intraday_rows(ts, sid=None, evs=None, include_gone=False, include_watch=Fals
         _cnt = int(e.get('count') or 1)
         _t = _first[11:16] if len(_first) >= 16 else ''
         _tl = _last[11:16] if len(_last) >= 16 else ''
+        # ★ 2026-10-08 收盘对账（见 docstring）：15:00 后且当日账本已落地才判，避免误杀
+        _conf, _lg_st = None, ''
+        if _cl and ledger:
+            _lr = ledger.get(str(e.get('sname') or ''))
+            if _lr is not None:
+                _lg_st = str(_lr.get('status') or '未触发')
+                _conf = bool(_lr.get('triggered')) or _lg_st in _CONFIRM_ST
         if e.get('gone'):
             _nxt = ('盘中曾触发（%s%s）后信号未持续（%s）；若收盘重新确认则以收盘判定为准'
                     % (_t, ('～' + _tl) if (_tl and _tl != _t) else '',
                        str(e.get('gone_reason') or '信号消失')))
+        elif _conf is False:
+            _nxt = ('盘中实时触发（%s%s），今日收盘用真实收盘价重判未成立（当日账本判定：%s）'
+                    '→ 本条不执行，仅留痕'
+                    % (_t, ('（共%d次，最近 %s）' % (_cnt, _tl)) if _cnt > 1 else '', _lg_st))
         elif _cl:
             _nxt = ('盘中实时触发（%s%s），今日收盘已确认，于 %s 按本策略时点买入（T+1）'
                     % (_t, ('（共%d次，最近 %s）' % (_cnt, _tl)) if _cnt > 1 else '', _md(ex)))
@@ -183,9 +206,13 @@ def intraday_rows(ts, sid=None, evs=None, include_gone=False, include_watch=Fals
         out.append({'_intra': True, 'kind': '买入信号', 'status': '买入信号', 'date': d0, 'name': nm,
                     'sid': str(e.get('sname') or ''), 'code': str(e.get('code') or ''),
                     'gone': bool(e.get('gone')),   # ★ 2026-09-17 供调用方区分"仍在触发/已消失"
+                    # ★ 2026-10-08 收盘对账结论：False=收盘已用真实收盘价重判、本条不成立（不执行）；
+                    #   None=无可对账的当日账本行（盘中 / 该策略无账本如空间龙盯盘）→ 维持原行为
+                    '_confirmed': _conf,
+                    '_ledger_status': _lg_st,
                     'score': _sc, 'price': _px,
                     'buy_ref': e.get('buy_ref'), 'stop': e.get('stop'), 'target': e.get('target'),
-                    'tag': ('收盘确认' if _cl else '盘中触发'),
+                    'tag': ('收盘未确认' if _conf is False else ('收盘确认' if _cl else '盘中触发')),
                     'source': 'intraday',
                     'note': (f'{_md(d0)} ' + _nxt
                              + (('：' + '，'.join(_pxs)) if _pxs else '')

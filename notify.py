@@ -66,6 +66,34 @@ _BRIEF_FILE = os.path.join(_WORKSPACE, 'data', 'notify_brief_sent.json')
 _SIG_FILE = os.path.join(_WORKSPACE, 'data', 'notify_signal_sent.json')   # 历史遗留（仅迁移）
 _EV_FILE = os.path.join(_WORKSPACE, 'data', 'intraday_signals.json')       # 历史遗留（仅迁移）
 
+# ★ 2026-10-09 用户要求：盘中信号"发出去又消失"太误导 —— 改为**稳定后再推**。
+#   盘中每轮扫描（app.SCAN_SECONDS=300，即 5 分钟）触发一次，其中相当一部分下一轮就不成立
+#   （盘中用实时价拼伪 bar 估算，冲高即触发、回落即消失）。现在要求**连续 N 轮扫描仍在触发**
+#   才发邮件；中途消失的不发（仍照常落库留痕，/signals 页可查）。
+#   改阈值只动这里：1=恢复"触发即推"，3=更严（约 10~15 分钟）。
+INTRADAY_STREAK_MIN = 2
+# 连续轮数计数器：{(trade_date, sname, code): 连续触发轮数}，进程内维护。
+# 只影响"什么时候发邮件"，不影响落库/留痕 —— 服务重启计数归零，最坏是当天首条推迟一轮再发
+# （宁可晚发/不发，也不发一条马上就消失的信号）。未触发由 intraday_signal_clear 清零。
+_STREAK = {}
+
+
+def _streak_bump(sname, code, trade_date=None):
+    """本轮该策略该标的**仍在触发** → 连续轮数 +1，并清掉同策略其它标的（已换标的/gone）。"""
+    d = trade_date or _today()
+    _key = (d, str(sname), str(code or ''))
+    for k in [k for k in _STREAK if k[0] != d or (k[1] == str(sname) and k[2] != str(code or ''))]:
+        _STREAK.pop(k, None)        # 顺带清掉往日残留，避免无限增长
+    _STREAK[_key] = _STREAK.get(_key, 0) + 1
+    return _STREAK[_key]
+
+
+def _streak_reset(sname, trade_date=None):
+    """本轮该策略未触发/无候选 → 连续轮数清零（下一轮重新计数）。"""
+    d = trade_date or _today()
+    for k in [k for k in _STREAK if k[0] == d and k[1] == str(sname)]:
+        _STREAK.pop(k, None)
+
 _state = {
     'sent_date': None,     # 当日已发送日期（用于跨日重置计数/去重）
     'sent_today': 0,       # 当日普通消息计数
@@ -478,8 +506,14 @@ def signal_day_stats(date=None, include_deleted=False):
         return {'total': 0, 'live': 0, 'gone': 0, 'pushed': 0, 'deleted': 0}
 
 
-def send_intraday_signal(rec, sname=''):
-    """盘中扫描到买入信号时实时推送。
+def send_intraday_signal(rec, sname='', require_streak=True):
+    """盘中扫描到买入信号时实时推送（**稳定后**才推）。
+
+    ★ 2026-10-09：默认 require_streak=True —— 需**连续 INTRADAY_STREAK_MIN 轮扫描仍在触发**
+      才发邮件（用户反馈"信号发出去又消失了"，盘中用实时价拼伪 bar，冲高即触发、回落即消失）。
+      未达轮数 → 照常落库留痕、不发邮件；信号中途消失 → 计数清零，永不补发。
+    ★ require_streak=False 只给**确定性决策**用（如 space_watch 14:57 收盘确认封板买入，
+      它一天只确认一次、不存在"下一轮还在不在"的问题，被轮数挡住会漏发）。
 
     去重口径（2026-09-10 修订，用户反馈"同一标的当天被推了两次"）：
     - 当日同策略同标的 **只推一次**（即使盘中信号短暂消失又回来，也不再重推）；
@@ -495,16 +529,30 @@ def send_intraday_signal(rec, sname=''):
     #   之后 → 推送通道一关（notify_config.json enabled=false 或通道配错），信号连库都不落，
     #   又会重现"推荐过却哪里都查不到"。留痕与推送彻底解耦，/signals 历史始终完整。
     ev = record_intraday_signal(rec, sname) or {}
+    # ★ 连续轮数计数（落库之后、推送开关之前：关了推送也要正确计数，且留痕不受影响）
+    _n = _streak_bump(sname, code, trade_date=_ev_date(rec)) if require_streak else 0
     if not enabled():
         return False
     if ev.get('pushed'):
         _log(f'盘中信号当日已推送过，跳过: {sname} {nm}（{code}）')
         return False
+    if require_streak and _n < INTRADAY_STREAK_MIN:
+        _log(f'盘中信号仅连续 {_n}/{INTRADAY_STREAK_MIN} 轮触发，待稳定后再推: '
+             f'{sname} {nm}（{code}）')
+        return False
     ts = _ev_ts(rec)
+    # 稳定性说明：首轮触发时刻 + 已持续轮数（让收件人知道这不是一闪而过的信号）
+    _stab = ''
+    if require_streak and _n >= INTRADAY_STREAK_MIN:
+        _fa = str(ev.get('first_at') or '')
+        _stab = f'（已连续 {_n} 轮扫描持续触发'
+        if len(_fa) >= 16:
+            _stab += f'，自 {_fa[11:16]} 起'
+        _stab += '）'
     lines = [
         f'# 📡 盘中触发买入信号',
         '',
-        f'**扫描触发**：{ts}（盘中实时预估；收盘价确认后于下一交易日 T+1 按策略时点买入）',
+        f'**扫描触发**：{ts}{_stab}（盘中实时预估；收盘价确认后于下一交易日 T+1 按策略时点买入）',
         f'**策略**：{sname}',
         f"**标的**：{rec.get('name')}（{code}）",
         f"**现价**：{rec.get('price')} ｜ **评分**：{rec.get('score')}",
@@ -544,14 +592,20 @@ def intraday_signal_clear(sname, code=None):
     """每次盘中扫描后由 app.py 调用：本策略当前已不再持有该触发信号（未触发/无候选/换标的）。
     ★ 2026-09-10 起只把事件**改标志位** gone=1（行保留在 SQLite，页面仍可见"曾触发过"，
     事后也能在「盘中信号历史」页调取），不再删除记录；
-    是否重推由 pushed 标志位决定（当日同策略同标的只推一次）。"""
+    是否重推由 pushed 标志位决定（当日同策略同标的只推一次）。
+    ★ 2026-10-09：同时清零该策略的连续触发计数（下一轮重新累计，见 INTRADAY_STREAK_MIN）。"""
+    _streak_reset(sname)
     mark_intraday_gone(str(sname))
 
 
 # ---------------- 收盘简报 ----------------
 
-def send_close_brief(market=None, rec=None, sname=None, hist=None):
-    """收盘简报：今日推荐 + 行情判断/明日预判 + 昨日信号T+1结果 + 各策略状态。
+def send_close_brief(market=None, rec=None, sname=None, hist=None, review=None):
+    """收盘简报：**复盘** + 行情判断/明日预判 + 今日推荐 + 昨日信号T+1结果 + 各策略状态。
+
+    review（2026-10-08 新增）：review.py 产出的复盘 dict（或已渲染好的文本），
+    含大盘/量价/情绪（涨停·炸板·连板·晋级）/估值/消息面 + 持仓复盘 + 当日卖出复盘 +
+    明日行动。传入为 dict 时在此渲染为 Markdown。
     所有参数均为纯数据，由 app.py 组装传入，本模块不 import 业务代码。
     跨启动去重：同一自然日已成功推送过（无论是否重启）则不再重复推送。"""
     if not enabled():
@@ -561,6 +615,23 @@ def send_close_brief(market=None, rec=None, sname=None, hist=None):
         _log('收盘简报今日已推送过（跨启动去重），跳过')
         return False
     lines = [f'# 📊 收盘简报  {today}', '']
+    # ★ 复盘（大盘/量价/情绪/持仓/卖出/明日行动）
+    _rv_txt = review if isinstance(review, str) else ''
+    if isinstance(review, dict):
+        try:
+            import review as _rmod
+            _rv_txt = _rmod.render_md(review)
+        except Exception as e:
+            _rv_txt = ''
+            _log(f'复盘渲染失败: {str(e)[:80]}')
+        if _rv_txt:
+            lines.append('## 🔍 今日复盘')
+            lines.append(_rv_txt)
+            lines.append('')
+    elif _rv_txt:
+        lines.append('## 🔍 今日复盘')
+        lines.append(_rv_txt)
+        lines.append('')
     # 行情判断 / 明日预判
     if market and market.get('asof'):
         sh = market['sh']
@@ -592,7 +663,8 @@ def send_close_brief(market=None, rec=None, sname=None, hist=None):
             lines.extend(t1)
             lines.append('')
     # 各策略今日状态摘要
-    if hist:
+    # ★ 有复盘时省略：持仓/明日行动已在复盘块里逐条列出，避免同一信息重复两遍
+    if hist and not _rv_txt:
         lines.append('**📋 各策略今日状态**')
         for s in hist['strategies']:
             daily = s.get('daily', [])
