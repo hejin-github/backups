@@ -295,9 +295,17 @@ def frozen_open(daily):
 # 首页「📌 信号登记」块：待执行信号统一收集
 # ============================================================
 
-def register_rows(history, ts, intraday=None):
+def register_rows(history, ts, intraday=None, susp_hint=None):
     """首页总账顶部「信号登记」块的行数据（2026-09-09 口径：信号触发/判定当日即登记，
     不必等收盘后模拟成交才有记录）。
+
+    ★ 2026-10-14 新增 susp_hint：可调用对象 f(code)->str|None，返回该标的的停牌提示文案
+      （今日停牌 / 盘前疑似停牌），None 表示无需提示。只追加到"执行日=今天"的待执行行
+      文案里，不改 kind/status（登记口径不变）。
+      放这里做参数而不直接引 app 的 RT_SNAPSHOT：本模块不依赖 app 全局状态（见 ui_common
+      顶部约定），由 app 侧注入判定能力。
+    ★ 同日修复：账本行的 code 此前硬编码为空字符串（页面看不到代码、也无法按代码判停牌），
+      现改为取账本行的 code。
 
     覆盖三类：
       ① 今日盘中实时触发（SQLite 事件流 / TODAY_STATUS 回退）
@@ -336,16 +344,21 @@ def register_rows(history, ts, intraday=None):
         d0 = str(last.get('date') or '')
         ex = _next_td(d0)
         _sid = s.get('name') or ''
+        _cd = str(last.get('code') or '')
+        # ★ 停牌提示：只在"执行日=今天"时才提示（未来执行日的行说"今日停牌"没有意义）
+        _sh = (susp_hint(_cd) if (susp_hint and _cd and ex == _d0) else None)
+        _sh_txt = (f'；⚠ {_sh}' if _sh else '')
         if st in ('买入信号', '买入信号(待成交)') and nm:
             rows.append({'sid': _sid, 'kind': '买入信号', 'source': 'closed',
-                         'tag': '收盘已判定（待执行）', 'name': nm, 'code': '', 'extra': '',
+                         'tag': '收盘已判定（待执行）', 'name': nm, 'code': _cd, 'extra': '',
                          'time_txt': f'{_md(d0)} 收盘',
-                         'desc': f'信号确认，{_md(ex)} 按策略时点买入（T+1，不追价）'})
+                         'desc': (f'信号确认，{_md(ex)} 按策略时点买入（T+1，不追价）'
+                                  + _sh_txt)})
         elif st == '卖出信号' and nm:
             rows.append({'sid': _sid, 'kind': '卖出信号', 'source': 'closed',
-                         'tag': '收盘判定（待执行）', 'name': nm, 'code': '', 'extra': '',
+                         'tag': '收盘判定（待执行）', 'name': nm, 'code': _cd, 'extra': '',
                          'time_txt': f'{_md(d0)} 收盘',
-                         'desc': f'判定离场，{_md(ex)} 按策略时点卖出'})
+                         'desc': (f'判定离场，{_md(ex)} 按策略时点卖出' + _sh_txt)})
         # 未决换仓候选 → 独立「买入信号」登记（9/8 建仓龙版传媒→百大集团 场景）
         info = pending_candidate(last)
         if info:

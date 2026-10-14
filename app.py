@@ -544,6 +544,71 @@ def _is_suspended_today(code, today):
     return False
 
 
+def _suspended_prev_td(code, today=None):
+    """★ 2026-10-14：该股**上一交易日**是否无成交（仍在停牌中）——仅供盘前预警用。
+
+    口径同 history_engine 的停牌帧（history_engine.py:1194）：**只看成交量 <= 0**，
+    不像 `_is_suspended_today` 那样还要看今开 —— CSV 的停牌帧今开可能是 0 也可能是前收。
+    取 today 之前最近的一行；找不到返回 False。
+    """
+    code = str(code or '')
+    today = today or datetime.date.today().isoformat()
+    if not code:
+        return False
+    try:
+        with open(os.path.join('data', 'csv', f'{code}.csv'), encoding='utf-8') as f:
+            lines = [x for x in f.read().strip().splitlines() if x.strip()]
+        if len(lines) < 2:
+            return False
+        prev = None
+        for x in reversed(lines[-3:]):
+            p = x.split(',')
+            if p and p[0].strip() < today:
+                prev = p
+                break
+        if not prev or len(prev) <= 6:
+            return False
+        try:
+            return (float(prev[6]) if prev[6] else 0.0) <= 0
+        except (TypeError, ValueError):
+            return False
+    except Exception:
+        return False
+
+
+def _susp_hint(code, today=None):
+    """★ 2026-10-14：**待执行买卖行统一的停牌提示文案**；无需提示返回 None。
+
+    用户 10/14 遇到的情况：S16/S16V2 的挂单标的（新华传媒 600825）10/13 起停牌，
+    首页却照常写着"10月14日按本策略时点成交"。原因是盘前（<9:30）快照全 0 不可信，
+    `_is_suspended_today` 按设计返回 False（防 9/19 那次"全员误判停牌"）。
+
+    两档提示（都只加文案，不改 kind/status，登记口径不变）：
+      · 今日停牌（已有当日快照且无成交）→ 确定结论：挂单顺延至复牌日；
+      · 盘前/非交易日（快照不可信）且**上一交易日无成交** → 预警：疑似仍在停牌，开盘后确认。
+        ——停牌是延续性事件，昨天无成交今天大概率仍无成交，盘前据此提醒比"照常今日成交"靠谱。
+    """
+    code = str(code or '')
+    today = today or datetime.date.today().isoformat()
+    if not code:
+        return None
+    if _is_suspended_today(code, today):
+        return '标的今日停牌（无成交），挂单顺延至复牌日，信号不废弃'
+    if not _suspended_prev_td(code, today):
+        return None
+    # 当日行情不可得的两情形（此时不能下"今日可成交"的结论）：
+    #   ① 盘前/非交易日 → 等开盘后确认；
+    #   ② 盘中但 RT_SNAPSHOT 没取到该股当日行情（服务刚重启、首轮扫描未跑完）→ 以实际为准。
+    if _snapshot_unreliable(today):
+        return ('该股上一交易日无成交（疑似仍在停牌），今日开盘后确认；'
+                '若今日仍停牌则挂单顺延至复牌日')
+    _rt = (RT_SNAPSHOT or {}).get(code)
+    if not (isinstance(_rt, dict) and str(_rt.get('date') or '') == today):
+        return ('该股上一交易日无成交（疑似仍在停牌）；当前未取到今日行情，'
+                '以实际成交为准，若今日仍停牌则挂单顺延至复牌日')
+    return None
+
+
 def daban_realtime_note(code, today=None):
     """★ 2026-09-28：龙头接力类推荐的【实盘证伪】提示。
 
@@ -1481,7 +1546,7 @@ def _pending_signals_html():
       总账、今日行动清单共用同一套判定），本函数只负责把行渲染成 HTML —— 顺带修掉旧实现里
       「未决换仓候选」判定用 startswith('已换仓') 漏判后缀式「特  力Ａ（已换仓）」的问题。"""
     try:
-        rows = signal_rows.register_rows(HISTORY, TODAY_STATUS)
+        rows = signal_rows.register_rows(HISTORY, TODAY_STATUS, susp_hint=_susp_hint)
         if not rows:
             # ★ 2026-09-17：**空态也渲染本块**。此前 return '' 会让首页整块消失，用户无法区分
             #   "今天没有待执行信号"与"页面漏了 / 信号凭空没了"（本次"记录查不到"的困惑之一）；
@@ -3600,6 +3665,12 @@ def today_action_card():
                     _fut.append(('buy', f'{head} → <b class="st ok">{_md(ex)}买入 {nm}（{cd}）{sc_txt}</b>'
                                         f'：⚠ 标的今日停牌（无成交），买入挂单顺延至复牌日，信号不废弃'))
                 elif ex == today:
+                    # ★ 2026-10-14 盘前疑似停牌预警：_is_suspended_today 在 9:30 前按设计
+                    #   不下结论（防 9/19 全员误判），但停牌是延续性事件 —— 上一交易日无成交
+                    #   时仍要提醒"开盘后确认"，不能照常写"今日按本策略时点成交"。
+                    _sh = _susp_hint(_cd_raw, today)
+                    _sh_html = ('<br><span style="color:#e67e00;font-weight:600">⚠ %s</span>'
+                                % html.escape(str(_sh))) if _sh else ''
                     # ★ 实盘证伪：静态推荐在执行日必须由实盘修正（炸板/买不进）
                     _dn = daban_realtime_note(_cd_raw, today)
                     _dn_html = ''
@@ -3609,7 +3680,8 @@ def today_action_card():
                         _dn_html = ('<br><span style="color:%s;font-weight:600">%s %s</span>'
                                     % (_col, _ico, html.escape(str(_dn[1]))))
                     _act.append(('buy', f'{head} → <b class="st ok">{_md(ex)}买入 {nm}（{cd}）{sc_txt}</b>'
-                                        f'：{_md(L)} 收盘信号确认，{_md(ex)}按本策略时点成交，不追价' + _dn_html))
+                                        f'：{_md(L)} 收盘信号确认，{_md(ex)}按本策略时点成交，不追价'
+                                        + _sh_html + _dn_html))
                 else:
                     _fut.append(('buy', f'{head} → <b class="st ok">{_md(ex)}买入 {nm}（{cd}）{sc_txt}</b>'
                                         f'：{_md(L)} 收盘确认，{_md(ex)}按本策略时点执行'))
@@ -3785,6 +3857,11 @@ def yesterday_signal_card():
             st_cls, st_txt = 'ok', f'今日已按昨日信号买入成交（模拟，投入 {trec.get("invest"):,.2f} 元）'
         else:
             st_cls, st_txt = 'warn', '今日待执行：按本策略时点买入（T+1，勿手动追价，等策略时点）'
+        # ★ 2026-10-14：标的停牌/疑似停牌时，"今日待执行"这句会误导去下单 —— 追加提示
+        _ycd = str(yrec.get('code') or '')
+        _yhint = _susp_hint(_ycd, t_str) if _ycd else None
+        if _yhint:
+            st_txt += f'（⚠ {_yhint}）'
         st_txt_html = html.escape(st_txt)
         return (f'<div class="card" style="border-left:4px solid #e8a13c;cursor:pointer" '
                 f'onclick="location.href=\'/s/{urllib.parse.quote(s["name"])}\'">'
