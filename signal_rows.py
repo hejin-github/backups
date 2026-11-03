@@ -92,13 +92,16 @@ def _intraday_row_from_ts(ts, sid=None):
         return None
     ex = _next_td(d0)
     _cl = datetime.datetime.now().hour >= 15   # ★ 2026-09-10 收盘后改用"已确认"口径
+    # ★2026-11-03 盘中预告/收盘可执行：仅收盘后才可能成为可执行信号，盘中一律为"预告/观察"
+    _exec = _cl
     if _cl:
         _note = (f'{_md(d0)} 收盘已确认（收盘价 {_dash(sig.get("price"), "—")}，'
                  f'评分 {_dash(sig.get("score"), "—")}'
                  + (f'，{sig.get("tag")}' if sig.get('tag') else '')
                  + f'）：于 {_md(ex)} 按本策略时点买入（T+1）')
     else:
-        _note = (f'{_md(d0)} 盘中实时触发（现价 {_dash(sig.get("price"), "—")}，'
+        _note = ('【盘中预告·非可下单信号】'
+                 f'{_md(d0)} 盘中实时触发（现价 {_dash(sig.get("price"), "—")}，'
                  f'评分 {_dash(sig.get("score"), "—")}'
                  + (f'，{sig.get("tag")}' if sig.get('tag') else '')
                  + f'）：收盘价确认后于 {_md(ex)} 按本策略时点买入（T+1）；'
@@ -107,8 +110,9 @@ def _intraday_row_from_ts(ts, sid=None):
             'sid': rot, 'code': str(sig.get('code') or ''),
             'score': sig.get('score'), 'price': sig.get('price'),
             'buy_ref': sig.get('buy_ref'), 'stop': sig.get('stop'), 'target': sig.get('target'),
-            'tag': ('收盘确认' if _cl else '盘中触发'),
+            'tag': ('收盘确认' if _cl else '盘中预告'),
             'source': 'intraday',
+            '_executable': _exec,
             'note': _note}
 
 
@@ -203,6 +207,11 @@ def intraday_rows(ts, sid=None, evs=None, include_gone=False, include_watch=Fals
             _pxs.append(f'{"收盘价" if _cl else "现价"} {_px}')
         if _sc is not None:
             _pxs.append(f'评分 {_sc}')
+        # ★2026-11-03 可执行性判定：仅"收盘后 + 收盘对账未证伪"才算可执行信号；
+        #   其余（盘中触发 / 收盘证伪）一律为"预告/留痕"，下游推送须以 _executable 为准。
+        _exec = bool(_cl and _conf is not False)
+        # 盘中（未收盘）统一加"非可下单信号"前缀，消除 intraday↔close 矛盾（10/08 S9 案例）
+        _prefix = '' if _cl else '【盘中预告·非可下单信号】'
         out.append({'_intra': True, 'kind': '买入信号', 'status': '买入信号', 'date': d0, 'name': nm,
                     'sid': str(e.get('sname') or ''), 'code': str(e.get('code') or ''),
                     'gone': bool(e.get('gone')),   # ★ 2026-09-17 供调用方区分"仍在触发/已消失"
@@ -210,11 +219,12 @@ def intraday_rows(ts, sid=None, evs=None, include_gone=False, include_watch=Fals
                     #   None=无可对账的当日账本行（盘中 / 该策略无账本如空间龙盯盘）→ 维持原行为
                     '_confirmed': _conf,
                     '_ledger_status': _lg_st,
+                    '_executable': _exec,
                     'score': _sc, 'price': _px,
                     'buy_ref': e.get('buy_ref'), 'stop': e.get('stop'), 'target': e.get('target'),
-                    'tag': ('收盘未确认' if _conf is False else ('收盘确认' if _cl else '盘中触发')),
+                    'tag': ('收盘未确认' if _conf is False else ('收盘确认' if _cl else '盘中预告')),
                     'source': 'intraday',
-                    'note': (f'{_md(d0)} ' + _nxt
+                    'note': (_prefix + _md(d0) + ' ' + _nxt
                              + (('：' + '，'.join(_pxs)) if _pxs else '')
                              + (f'，{e.get("tag")}' if e.get('tag') else ''))})
     return out

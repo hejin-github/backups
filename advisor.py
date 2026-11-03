@@ -119,17 +119,31 @@ def backfill_today(rt):
             continue
         try:
             fp = f'data/csv/{code}.csv'
+            # ★2026-11-03 卡死根因修复：旧文件本身缺失/0 字节时绝不新建 0 字节 CSV，
+            #   否则全市场扫描在 _zt_col 抛 IndexError、leaders 缓存永不落盘 → 收盘扫描卡死。
+            if not (os.path.exists(fp) and os.path.getsize(fp) >= 32):
+                continue
             df = pd.read_csv(fp, encoding='utf-8-sig')
             df['日期'] = pd.to_datetime(df['日期'])
             df = df.sort_values('日期').reset_index(drop=True)
+            n_old = len(df)
             df2, _ = _apply_realtime(df, info, d, code)
-            # ★2026-09-18：绝不把空表写回 CSV（曾把 603797.csv 覆盖成 0 字节 → 全市场
-            #   扫描在 _zt_col 抛 IndexError、leaders 缓存永不落盘 → 收盘扫描卡死 49 小时）
-            if market_closed and df2 is not None and len(df2):
+            # ★2026-11-03 写回前校验：新表非空、行数合理（实时叠加只会=原行数或+1，绝不应更少）、
+            #   且关键行情列不是整行全 NaN。任一不满足 → 保留旧文件并告警，绝不写 0 字节/坏文件。
+            _cols = [c for c in ('开盘', '最高', '最低', '收盘') if c in df2.columns]
+            _all_nan = bool(_cols) and bool(df2[_cols].isnull().all(axis=1).any())
+            _ok = (market_closed and df2 is not None and len(df2) > 0
+                   and len(df2) >= n_old and not _all_nan)
+            if _ok:
                 df2.to_csv(fp, index=False, encoding='utf-8-sig')
                 saved += 1
-        except Exception:
-            continue
+            else:
+                print('[数据告警] 拒写回 %s：新表行数异常(旧%d/新%s)或盘中未收盘，保留旧文件'
+                      % (code, n_old, len(df2) if df2 is not None else 'None'), flush=True)
+        except Exception as e:
+            # ★2026-11-03 不再静默吞掉异常：记录告警，旧文件保持不变
+            print('[数据告警] backfill_today 处理 %s 失败，跳过并保留旧文件：%s'
+                  % (code, str(e)[:120]), flush=True)
     if not qdate:
         asof = {'label': '本地数据（无实时行情）', 'detail': ''}
     elif qdate == today_s:

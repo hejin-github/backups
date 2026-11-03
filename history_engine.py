@@ -11,7 +11,7 @@
 - T+1涨跌 = 选股标的下一个交易日开盘 / 信号日收盘 - 1（事后统计，仅复盘）
 - 状态: 买入信号 / 建仓 / 持有 / 卖出信号 / 卖出成交 / 空仓 / 资金不足
 """
-import sys, os, json, datetime
+import sys, os, json, datetime, random
 _WORKSPACE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _WORKSPACE)
 os.chdir(_WORKSPACE)
@@ -19,6 +19,10 @@ import pandas as pd
 import numpy as np
 import backtest as bt
 from stock_bot import advisor
+
+# ★2026-11-03 打板成交 realism：封板≠全额成交。独立 RNG（固定种子→回测可复现），
+# 避免污染其他随机逻辑。仅影响回测/模拟口径，实盘 S16/S20 仍按交易所真实成交。
+_daban_rng = random.Random(20260701)
 
 START = pd.Timestamp('2026-07-01')  # 模拟交易起点：2026-07-01 起为真实模拟交易，此前历史仅作回测
 CAPITAL = 5000.0
@@ -113,6 +117,22 @@ STRATEGY_TIMING = {
     #   卖=次日开盘（吃"再涨停"后的跳空溢价，这是本策略收益的主要来源）。
     'S21_好票调整不破位': ('close', 'open'),
 }
+# ===========================================================================
+# ★2026-11-03 样本外(OOS)验证钩子（过拟合警示）
+# 上方 STRATEGY_TIMING 的买/卖时点均为【全样本回测最优】选择（见各策略注释里的
+# "+4547 / +3758 / ..." 等回测收益）。这种"全样本挑最优参数"存在典型过拟合 / 幸存者偏差风险：
+# 同一套时点组合未必在未来样本外同样有效。当前过滤器 adopted=[]（无样本外启用的改进过滤器）。
+# 为后续严谨验证保留切分钩子：将 2024-01-01 起的行情标记为【验证集】，仅做注释级 / 轻量切分，
+# 不强行重写生产口径。调用方可用 is_oos(d) 判断某日是否落在验证集，从而隔离样本内/外统计。
+OOS_START = '2024-01-01'     # 验证集起点（样本外）；此前为样本内(训练集)
+def is_oos(d):
+    """某交易日 d('YYYY-MM-DD' 或 Timestamp) 是否落在样本外验证集。"""
+    try:
+        return pd.Timestamp(d) >= pd.Timestamp(OOS_START)
+    except Exception:
+        return False
+# 说明：本钩子当前仅用于统计隔离；生产回测口径保持不变（adopted=[]），不自动改写任何策略参数。
+# ===========================================================================
 # ★2026-10-28 S21 选股与换仓（依据 _s21_switch2.py 全史验证，193 笔 / 单持仓全仓）：
 #   ① 同日多信号改【挑 MA20 斜率最小】者（趋势最弱=最没启动），不再按评分取最高：
 #        按代码顺序(现状) +17.8%  →  按 ma20_slope 挑最弱 +25.3%
@@ -239,6 +259,16 @@ S16_DABAN_POOL_TOPN = 5            # 候选池大小（顺延深度）；=1 即�
 #     但它的回测（bt_newskills）从未按换手筛选，故由调用点按 sname 传参，S20 传 None 不受影响。
 S16_DABAN_MAX_TURNOVER = 15.0
 
+# ★2026-11-03 打板成交 realism：原口径假设"封板日按涨停价(=收盘)全额成交"，忽略了
+#   真实市场中"排队买不进 / 部分成交 / 滑点"。现引入抽样修正（均为保守估计，可调）：
+#   · S16_DABAN_FILL_PROB：封板率/排队成功率代理，以该概率中签；未中签→当日"未成交"，空仓重扫。
+#   · S16_DABAN_FILL_RATIO：中签后成交比例区间（部分成交），不足 1 手视同未成交。
+#   · S16_DABAN_SLIPPAGE：打板滑点/排队成本（0.3%），抬高实际买入成本。
+#   本改动只作用于回测/模拟(simulate_stock)，实盘 S16/S20 仍按交易所真实成交价，不影响实盘推送。
+S16_DABAN_FILL_PROB = 0.85
+S16_DABAN_FILL_RATIO = (0.6, 1.0)
+S16_DABAN_SLIPPAGE = 0.003
+
 ENV_NAMES = {'trend_up': '趋势向上', 'range': '震荡', 'weak': '弱势/超跌'}
 TIMING_LABEL = {
     ('open', 'open'): '早盘买/早盘卖',
@@ -258,7 +288,10 @@ def eligible(code, name):
         return False
     if code.startswith(('4', '8')):  # 北交所
         return False
-    if 'ST' in str(name).upper():    # ST
+    _n = str(name).upper()
+    if 'ST' in _n:    # ST / *ST
+        return False
+    if '退' in str(name):   # ★2026-11-03 退市也剔除（此前仅靠 ST 名过滤，退市股名常不含 ST）
         return False
     return True
 
@@ -924,6 +957,17 @@ def simulate_stock(sname, sfunc, afn, stocks, maps, buy_timing='open', sell_timi
                     row['note'] = (str(row.get('note') or '') +
                                    f'；首选{STOCKS.get(_pc0, _pc0)}买不进，顺延打板买入'
                                    f'{STOCKS.get(code, code)}').strip('；')
+                # ★2026-11-03 打板成交抽样（封板≠全额成交）：以 S16_DABAN_FILL_PROB 中签，
+                #   未中签 = 当日"排队未买到"→ 标记未成交、空仓，当日第 2 段照常重扫。
+                if _daban_rng.random() >= S16_DABAN_FILL_PROB:
+                    _nm0 = STOCKS.get(code, code)
+                    row['note'] = (str(row.get('note') or '') +
+                                   f'；打板排队未成交（封板率抽样未中签）：{_nm0}当日封板但'
+                                   f'排队未买到，本日不建仓，暂空仓').strip('；')
+                    pending = None
+                    break
+                # 中签 → 按区间随机抽样"部分成交"比例；不足 1 手视同未成交
+                pending['_daban_fill'] = _daban_rng.uniform(*S16_DABAN_FILL_RATIO)
             tl_b = '开盘' if buy_timing == 'open' else '收盘'
             tl_s = ('开盘止损' if pending.get('stop')
                     else ('开盘' if sell_timing == 'open' else '收盘'))
@@ -938,6 +982,22 @@ def simulate_stock(sname, sfunc, afn, stocks, maps, buy_timing='open', sell_timi
                 if _tail:
                     break
             if act == 'sell' and pos and pos['code'] == code and not np.isnan(op) and op > 0:
+                # ★2026-11-03 T+1 显式约束：A股 当日买入的持仓当日不可卖出。
+                #   （引擎本就次日才执行卖出挂单，此处显式兜底，防止同日买卖路径漏判）
+                if pos.get('buy_date') == d:
+                    row['note'] = (str(row.get('note') or '') +
+                                   f'；卖出挂单未成交（T+1：{STOCKS.get(code, code)}为今日买入，'
+                                   f'当日不可卖出，顺延至次一交易日）').strip('；')
+                    break
+                # ★2026-11-03 跌停不可成交：卖出日封死跌停（收盘≤昨收×0.905）→ 无买盘，卖不掉，标记未成交。
+                _prev_close = float(df.loc[k - 1, '收盘']) if (k and k > 0) else float('nan')
+                _is_zt_down = (np.isfinite(close) and close > 0 and np.isfinite(_prev_close)
+                               and _prev_close > 0 and close / _prev_close - 1 <= -0.095)
+                if _is_zt_down:
+                    row['note'] = (str(row.get('note') or '') +
+                                   f'；卖出挂单未成交（{STOCKS.get(code, code)}当日封死跌停，'
+                                   f'无买盘无法成交，持仓顺延）').strip('；')
+                    break
                 if pending.get('stop'):
                     # 止损：最快离场，T+1 次日开盘价成交（不受策略 sell_timing 尾盘时点影响）
                     sp = op
@@ -1137,7 +1197,8 @@ def simulate_stock(sname, sfunc, afn, stocks, maps, buy_timing='open', sell_timi
                 if pending.get('_daban'):
                     # ★2026-09-23 打板口径：无论是否换仓，成交价一律取【当日收盘】（=涨停价）。
                     #   （旧逻辑里「止损换仓」会按开盘价买入，那是追高口径，不适用于打板）
-                    px, tl_sw = close, '收盘'
+                    # ★2026-11-03 打板滑点/排队成本：实际成交成本 = 涨停价×(1+滑点)，抬高买入价。
+                    px, tl_sw = close * (1 + S16_DABAN_SLIPPAGE), '收盘'
                 elif pending.get('from_switch'):
                     # 换仓：先卖后买，与卖出同一成交时点（止损卖出=开盘，换仓买入同为开盘价）
                     if pending.get('stop') and not np.isnan(op) and op > 0:
@@ -1153,6 +1214,16 @@ def simulate_stock(sname, sfunc, afn, stocks, maps, buy_timing='open', sell_timi
                 shares = int(budget / (px * 100)) * 100
                 while shares >= 100 and bt.buy_cost(px, shares) > budget:
                     shares -= 100  # 含费总成本不超过预算上限，手数尽量接近（预算本身恒≤现金）
+                # ★2026-11-03 打板部分成交：按抽样比例缩减手数；不足 1 手视为未成交（排队只分到零股）。
+                if pending.get('_daban_fill'):
+                    _sh = int(shares * pending['_daban_fill'] / 100) * 100
+                    if _sh < 100:
+                        row['note'] = (str(row.get('note') or '') +
+                                       f'；打板部分成交不足1手（成交比例{round(pending["_daban_fill"], 2)}），'
+                                       f'本日不建仓，暂空仓').strip('；')
+                        pending = None
+                        break
+                    shares = _sh
                 if shares >= 100:
                     cost = bt.buy_cost(px, shares)
                     pos = {'code': code, 'buy_date': d, 'buy_idx': k, 'buy_price': px,
@@ -2296,12 +2367,34 @@ def _dp_score(k, df):
         return None
 
 
+def _dp_excluded(code, d, stocks=None, maps=None):
+    """★2026-11-03 幸存者/动量偏差治理：按交易日动态剔除
+    - ST/*ST（名称含 ST，大小写不敏感）
+    - 退市（名称含 退）
+    - 上市<60 交易日新股（该票自身数据首日到 d 不足 60 个交易日 → 视为次新股）
+    返回 True=应剔除。固定 STOCKS 已在 eligible() 剔创业板/科创板/北交/ST/退市，这里补足
+    「按交易日动态」维度（尤其新股随时间会"长大"进入可交易区间）。"""
+    name = STOCKS.get(code, '')
+    _n = str(name).upper()
+    if 'ST' in _n or '退' in str(name):
+        return True
+    # 上市<60日新股：用该票自身数据首日到 d 的交易日数判断（数据起点即近似上市日）
+    if stocks is not None and maps is not None and code in stocks and code in maps:
+        k = maps[code].get(d)
+        if k is not None and k < 60:
+            return True
+    return False
+
+
 def _dp_select(d, stocks, maps):
     """在候选（沪深主板 STOCKS）中按得分选出 top_n 只最强势标的作为动态池成分；
-    可评分候选不足 min_stocks 时全部纳入，仍为空（如基期数据不足）则回退全候选。"""
+    可评分候选不足 min_stocks 时全部纳入，仍为空（如基期数据不足）则回退全候选。
+    ★2026-11-03 选前统一过 _dp_excluded 动态过滤（ST/退市/上市<60日新股）。"""
     scored = []
     for code in STOCKS:
         if code not in stocks:
+            continue
+        if _dp_excluded(code, d, stocks, maps):   # ★ 动态剔除 ST/退市/次新股
             continue
         k = maps[code].get(d)
         if k is None:
