@@ -58,6 +58,8 @@ BUY_FILTERS = {
     'S15_缠论三买': ('sh_day_up', '上证当日上涨'),  # A/B(2026-08-31)：全市场22,296笔胜率45.5%→49.8%、每笔+70.9→+101.9；正式系统重放4笔25%净-805→50%净+221，拦下北方华创/中科三环/仁和药业/银星能源4个弱市信号
     'S16_龙头接力': None,  # 打板策略需波动，暂不过滤；落地后 A/B 验证再定（弱市由 STRATEGY_ENV_FIT 限制不建仓）
     'S16_龙头接力V2': None,  # 同 base：连板≥3 版龙头接力，暂不过滤
+    'S20_突破首板连阳': None,  # 同 S16：打板策略需波动，暂不过滤（弱市由 STRATEGY_ENV_FIT 限制不建仓）
+    'S21_好票调整不破位': None,  # 埋伏策略：已用「跌不下去」5 条硬门槛控质量，暂不加指数过滤
     'S7_沪深300PE分批低买高卖': ('sh_day_up', '上证当日上涨'),   # 落地验证：胜率50%→63%、净-1233→+571
     'S8_红利低估值分批买入': None,             # 2笔 样本过小
 }
@@ -103,7 +105,31 @@ STRATEGY_TIMING = {
     #   断板当日【收盘】卖（见 S16_SELL_SAME_CLOSE）。旧口径为 ('open','open')。
     'S16_龙头接力': ('close', 'close'),
     'S16_龙头接力V2': ('close', 'close'),
+    # ★2026-10-14 新增 S20：与 S16 同走【打板口径】——信号日收盘出信号，T+1 收盘
+    #   确认当日封板且非一字才以收盘价（=涨停价）买入；卖出同为收盘（断板当日收盘卖）。
+    'S20_突破首板连阳': ('close', 'close'),
+    # ★2026-10-23 新增 S21：与 S16/S20 不同，它是【埋伏】不是【打板】——买入价是普通价位
+    #   （非涨停价），一定能成交。买=T+1 收盘（校准实测优于 T+1 开盘：第5档均笔 +0.59% vs +0.45%）；
+    #   卖=次日开盘（吃"再涨停"后的跳空溢价，这是本策略收益的主要来源）。
+    'S21_好票调整不破位': ('close', 'open'),
 }
+# ★2026-10-28 S21 选股与换仓（依据 _s21_switch2.py 全史验证，193 笔 / 单持仓全仓）：
+#   ① 同日多信号改【挑 MA20 斜率最小】者（趋势最弱=最没启动），不再按评分取最高：
+#        按代码顺序(现状) +17.8%  →  按 ma20_slope 挑最弱 +25.3%
+#   ② 持仓中出现 MA20 斜率明显更弱的新信号 → 换仓（追回被持仓冲突丢弃的好票）。
+#   ⚠ 阈值按【系统真实口径】定（_s21_verify_sys.py：T+1 收盘买 / 本金5000 全押 / 193 笔，
+#      且已含下面的 S21_SWITCH_MIN_HOLD=2 约束——该约束把无谓换仓滤掉，反而更好）：
+#        MAXHOLD=9： 不换仓 +26.0%  换仓10% +29.1%  【换仓25% +33.5%（回撤29.0%，最优）】
+#        MAXHOLD=12：不换仓 +14.9%  换仓10% +20.8%  换仓25% +30.4%
+#        改动前（12日+按代码顺序+不换仓）：+13.4%、回撤 46.1%、终值 1.55 万
+#        改动后（9日+挑最弱+换仓25%）：    +33.5%、回撤 29.0%、终值 6.72 万
+#        逐年度：2018+5.27 2019+10.03 2020-0.12 2021+3.03 2022+6.08
+#                2023-2.38 2024+5.22 2025+10.47 2026-0.49（6 年正、3 年微负）
+#      （_s21_switch2.py 用开盘买口径得 38.7%，口径不同不可直接比较；本处以系统口径为准）
+S21_ORDER_KEY = 'ma20_slope'      # 同日排序键：升序取最小（非 S21 策略不受影响）
+S21_SWITCH_ENABLE = True          # True=持仓中主动换仓（卖出持仓并买入更优候选）
+S21_SWITCH_MARGIN = 0.25          # 新候选 MA20 斜率需优于在持仓 25% 才换仓
+S21_SWITCH_MIN_HOLD = 2           # 买入后至少持有 2 个交易日才允许换仓（防频繁换仓）
 # ★ 行情驱动的策略适配（2026-08-27）：每个策略标注其适配的行情环境；当日行情不适配时，
 #   该策略不建仓（状态显示"空仓"，note 注明原因）。行情环境由上证指数当日量价形态判定
 #   （见 market_env_on）：trend_up=趋势向上 / range=震荡 / weak=弱势/超跌。
@@ -120,7 +146,14 @@ STRATEGY_ENV_FIT = {
     'S15_缠论三买': {'trend_up', 'range'},            # 中枢突破回踩为趋势中继形态，仅趋势/震荡适配
     'S16_龙头接力': {'trend_up', 'range'},            # 打板接力需强势/活跃环境，弱市不建仓（防2025-08式炸板连亏）
     'S16_龙头接力V2': {'trend_up', 'range'},          # 同 base：连板≥3 版龙头接力
+    'S20_突破首板连阳': {'trend_up', 'range'},         # 同 S16：首板突破需强势/活跃环境，弱市不建仓
+    'S21_好票调整不破位': {'trend_up', 'range'},       # 埋伏等"再涨停"，弱市无人接力 → 不建仓
 }
+# ★ 2026-10-14 新增：除 S16 外，还有哪些策略走【断板当日收盘卖】
+#   （S16_SELL_SAME_CLOSE 是全局开关，直接置 True 会连 S16 一起改，故用这份名单单独开）。
+#   S20 回测口径就是"断板当日收盘卖"（回测 776 笔 +89,045 均在此口径下取得），
+#   若让引擎走默认的"挂单次一日开盘卖"，等于白白多挨一个隔夜低开（见 S16 出场 A/B）。
+SELL_SAME_CLOSE_EXTRA = ('S20_突破首板连阳',)
 # ★ 2026-09-03 次日开盘接力「二次校验」阈值：T 日收盘信号（最强龙头/强势）→ T+1 开盘接力买入。
 #   但 T+1 开盘可能把昨日强势直接证伪（一字跌停/竞价大幅低开 = 接力失败，且一字跌停本就无法成交）。
 #   引擎在 T+1 开盘成交前重新校验：开盘较上一交易日收盘低开 ≤ 阈值 → 判定昨日信号预测失败，
@@ -143,6 +176,28 @@ DISCARD_LOW_OPEN = {
 UNFILLABLE_ZT_OPEN = {
     'S16_龙头接力': 0.098,
     'S16_龙头接力V2': 0.098,
+}
+# ★ 2026-10-14 执行日「大跌/跌停」废弃（对称于开盘买的 DISCARD_LOW_OPEN，但针对**尾盘(收盘)买**策略）：
+#   T+1 执行日收盘较上一交易日收盘跌幅 ≤ 阈值 → 昨日"突破/强势"已被证伪，此时按收盘价买入
+#   等于接跌停板。废弃挂单、暂空仓；信号日行回写标注（口径同 DISCARD_LOW_OPEN）。
+#   背景案例：2026-10-14 S1_Christian突破回踩 农心科技（001231）—— 10/13 涨停收 28.17，
+#   以"60日涨幅56.8% + 突破20日高(25.61)" 入选评分 100；10/14 低开 -7.1% 后封死 -10.01%，
+#   当日尾盘买入即接盘。S16 的低开废弃救不了它：那份守卫只配了 S16 且只看【开盘】。
+#   ★ 阈值必须由全史 A/B 决定。2026-10-14 A/B（脚本 `_s1_drop_ab2.py`，close/close 生产口径
+#     自写循环，全市场 2603 只、2019-01 起、base 19063 笔 / -1,369,025 元）：
+#       阈值    剔除笔数  净利增量        被剔除交易的平均净利   逐年
+#       -9.5%     610    +113,475 (+8.3%)      -186 元/笔       8 年里 7 年改善（仅 2024 略差）
+#       -7.0%    1166    +132,162 (+9.7%)      -113 元/笔       8 年里 7 年改善（2024 明显差）
+#     取 **-9.5%**（跌停线，留 0.5% 容错）：它剔除的正是最坏的那批（均笔 -186 vs 整体 -72），
+#     而 -7% 多剔的 556 笔边际收益仅 +33.6 元/笔、且 2024 年反转 → 边际递减，按最小干预取前者。
+#     ★ 改这里 ≠ 账本自动变：必须重建账本（build，约 25 分钟，期间停服务），否则只有"改后
+#       新跑的当日行"生效，历史行仍是旧口径。
+DISCARD_DROP_CLOSE = {
+    'S1_Christian突破回踩': -0.095,
+    # ★2026-10-23 S21：买入是 T+1 收盘价，若执行日已砸到 -9.5%（跌停线，留 0.5% 容错），
+    #   尾盘买入即接刀 → 废弃。与 S1 同阈值（S1 全史 A/B：均笔 -186 的最坏一批被剔除）。
+    #   注：该守卫未包含在校准口径内，属额外保险，实盘效果以账本为准。
+    'S21_好票调整不破位': -0.095,
 }
 # ★ 2026-09-07 回退：周末一度把"开盘顶板买不进"守卫与信号日顺延扩到开盘买普通个股策略，
 #   经全史重放验证"买不进→顺延队内次强"显著增亏 → 只保留 S16 的真实成交校验（见上两个字典），
@@ -169,6 +224,20 @@ S16_SELL_SAME_CLOSE = True
 S16_DABAN_ENABLE = True
 S16_DABAN_SKIP_LIMIT_OPEN = True   # 执行日开盘≥涨停价×0.99 视为秒板买不进（与 backtest 同名常量一致）
 S16_DABAN_POOL_TOPN = 5            # 候选池大小（顺延深度）；=1 即只做龙一
+
+# ★2026-10-16 S16【换手龙过滤】开关（用户拍板："上换手<=15%"）。
+#   执行日当日换手率 > 阈值(%) 的候选跳过（顺延次强）；<=0 或 None 表示不过滤（旧行为）。
+#   口径（务必与回测 _s16_turn.py 一致）：
+#     · 取【执行日 = 买入当天】的换手率（非信号日）——回测里 arr['turn'][j] 的 j=k+1 同样是执行日
+#     · NaN/缺列的候选按【不满足】处理（跳过），与回测 _g(turn, 1e9) 同语义
+#   回测依据（_s16_turn.py / _s16_oob.py 半样本外验证，topn=5/daban/全史 2614 只/每笔 5000）：
+#     基线(名次优先) n=765 净+150,434 胜 50.5% 均笔 196.6 全押回撤 -54.5%
+#     换手<=15%       n=485 净+147,633 胜 58.1% 均笔 304.4
+#     训练段2018-22 263笔 均笔288.9 胜60.8% ★ / 验证段2023-26 222笔 均笔322.8 胜55.0% ★
+#     2024 单年 56笔 均笔433.1 胜46.4%（唯一胜率高于基线42.2%的一档，最扛极端行情）
+#   ★作用域：只作用于 S16/S16V2。S20 复用同一个 _s16_daban_pick，
+#     但它的回测（bt_newskills）从未按换手筛选，故由调用点按 sname 传参，S20 传 None 不受影响。
+S16_DABAN_MAX_TURNOVER = 15.0
 
 ENV_NAMES = {'trend_up': '趋势向上', 'range': '震荡', 'weak': '弱势/超跌'}
 TIMING_LABEL = {
@@ -491,13 +560,16 @@ def sh_window(date=None):
     return dict(r)
 
 
-def _scan_best(stocks, maps, d, afn, exclude=None):
+def _scan_best(stocks, maps, d, afn, exclude=None, order_key=None):
     """扫描当日评分最高的买入候选，返回 dict 或 None；只用当日及之前数据。
     exclude：排除的股票 code（如"卖出当日换仓"场景排除刚平仓的持仓股，避免卖后又买回同一只）。
+    order_key：非空时改按该字段【升序】取最小者（S21「同日挑 MA20 最弱」用，见 S21_ORDER_KEY）；
+               默认 None = 维持原「评分降序取最高」，其余策略行为完全不变。
     修复(2026-08-28)：优先返回「触发信号中评分最高」的候选（评分第一的股票常是已强势多日
     而非当日触发者，如 MACD 金叉/RSI 上穿 20 等瞬态信号），避免全市场下换仓候选永不触发。"""
     best = None
     best_trig = None
+    bk = bkt = 1e18       # order_key 模式下的当前最小值
     for code in STOCKS:
         if code == exclude or code not in stocks:
             continue
@@ -513,10 +585,19 @@ def _scan_best(stocks, maps, d, afn, exclude=None):
             continue
         r = dict(r)
         r['code'] = code
-        if r.get('triggered') and (best_trig is None or r['score'] > best_trig['score']):
-            best_trig = r
-        if best is None or r['score'] > best['score']:
-            best = r
+        if order_key:
+            kv = r.get(order_key)
+            if kv is None:
+                continue      # 缺该字段的候选不参与（非 S21 策略不会走到这里）
+            if r.get('triggered') and kv < bkt:
+                best_trig, bkt = r, kv
+            if kv < bk:
+                best, bk = r, kv
+        else:
+            if r.get('triggered') and (best_trig is None or r['score'] > best_trig['score']):
+                best_trig = r
+            if best is None or r['score'] > best['score']:
+                best = r
     return best_trig or best
 
 
@@ -531,9 +612,30 @@ SINGLE_CAP_POLICY = {
     'S16_龙头接力V2': 'half-cap',
 }
 
+# ★ 全押开关（2026-10-14 用户拍板「5000 就不用分仓了，50000 再分仓」）
+# 原 buy_budget_of 默认已是「可用现金全额」（=全押复利），仅 S16 两档被 half-cap 限制；
+# 本次把 S16 两档一并解锁，使 13 个策略在权益未过线前统一全押。
+# ★ 依据（脚本 _kelly_correct.py / _kelly_fullbet.py，数据 data/bt_s20_trades.csv，
+#        样本=S20 生产口径 510 笔；下列倍率均为比例，与本金 5000 还是 50000 无关）：
+#   ① 正确 Kelly 应是不对称公式 f*=p/c−q/b（c=平均亏损占下注比）。S20 有 −5% 止损+断板即卖，
+#      实测量得 p=0.439 / b=10.75% / c=4.65% → f*=4.23；旧标准 Kelly（假设亏光）误算 0.197。
+#      无杠杆约束下取 min(f*,1.0) → 全押最优。每笔几何增长：f=1.0 为 1.56%/笔，f=0.17 仅 0.34%/笔。
+#   ② 结构性不爆仓：历史最差单笔 −10.25%，f 需 >9.8 才可能归零；全押 f=1.0 安全边际充足。
+#   ③ bootstrap（有放回抽样 2000 次）：全押中位 3096x、5% 分位仍 71x、亏损概率 0%。
+#   ④ 代价需知：全押最大回撤 −41.88%，历史最惨一段权益从峰值回落到 38%。
+FULL_BET_ENABLE = True          # True=权益未过线前，每笔投入=全部可用现金（取消 S16 的 half-cap）
+FULL_BET_THRESHOLD = 50000.0    # 权益达到此线后恢复 half-cap 分仓（届时按 SINGLE_CAP_POLICY 执行）
+# 回滚：FULL_BET_ENABLE=False 即完全回到 2026-09-03 口径（含 S16 half-cap）。
+
 
 def buy_budget_of(sname, cash):
-    """单笔买入预算上限。默认返回可用现金全额；S16 两档按 half-cap 封顶。"""
+    """单笔买入预算上限。
+
+    FULL_BET_ENABLE 且权益 < FULL_BET_THRESHOLD → 返回可用现金全额（全押复利，含原 S16 两档）。
+    权益过线后沿用既有规则：S16 两档按 half-cap 封顶，其余策略全额。
+    """
+    if FULL_BET_ENABLE and cash < FULL_BET_THRESHOLD:
+        return cash
     if SINGLE_CAP_POLICY.get(sname) == 'half-cap':
         return max(CAPITAL, cash / 2.0)
     return cash
@@ -588,17 +690,21 @@ def _suspension_note(code, pending, ns):
     return n
 
 
-def _s16_cand_pool(d, topn=None):
+def _s16_cand_pool(d, topn=None, lb_range=None):
     """S16 打板口径：取信号日 d 的候选池（按名次：连板数降序、并列量比降序）。
     返回 [code, ...]；取不到返回 []。
 
     ★坑（2026-09-23 实测踩到）：bt._s16_space_pool 返回的 key 是【pd.Timestamp】
       （_s16_leaders 内部直接用 df['日期'] 建 by_date），而引擎日历 d 是 'YYYY-MM-DD'
       字符串 → 直接 pool.get(d) 恒为 None，候选池会静默退化成「只买首选」，顺延完全不生效
-      （表现：一切正常、无报错，但笔数明显偏少）。故这里两种 key 都试一次。"""
+      （表现：一切正常、无报错，但笔数明显偏少）。故这里两种 key 都试一次。
+
+    ★2026-10-26 lb_range：必须与信号选股用同一个连板区间（调用方传 bt.S16_LB_RANGE）。
+      若不传，候选池是全市场前 N 强 → 执行日按名次顺延时会买到【更高连板】的票，
+      信号端的连板上限被整个绕过（表现为"设了限制却没生效"）。"""
     topn = int(S16_DABAN_POOL_TOPN if topn is None else topn)
     try:
-        pool = bt._s16_space_pool(topn=topn)
+        pool = bt._s16_space_pool(topn=topn, lb_range=lb_range)
     except Exception:
         return []
     pl = pool.get(d)
@@ -612,13 +718,29 @@ def _s16_cand_pool(d, topn=None):
     return [c for c, _lb, _vr in pl if c]
 
 
-def _s16_daban_pick(cands, stocks, maps, d):
+def _s16_turnover(cdf, ck):
+    """取 cdf 第 ck 行（★位置索引，与 zt[ck] 同源）的换手率(%)。缺列/缺值返回 None。
+
+    ★坑：不能用 `cdf.get('换手率') or ...`——Series 做真值判断抛 ValueError，
+      必须 `is None` 判空（2026-09-16 pandas 老坑同源）。"""
+    try:
+        col = cdf.get('换手率')
+        if col is None:
+            return None
+        v = pd.to_numeric(col.iloc[ck], errors='coerce')
+    except Exception:
+        return None
+    return float(v) if v == v else None
+
+
+def _s16_daban_pick(cands, stocks, maps, d, max_turn=None):
     """S16 打板口径【顺延选股】：按名次取第一个「当日封涨停且买得进」的标的。
     返回 (code, df, k) 或 None（全池都买不进 → 当日空仓）。
 
     ★与回测 backtest.run_s16_daban_pool_market 完全同口径：
         · 当日 zt >= 9.5%（封板才谈得上打板）
         · 非一字板；S16_DABAN_SKIP_LIMIT_OPEN 时另排除「开盘≥涨停价×0.99」的秒板
+        · max_turn 非 None 时：换手率 > max_turn(%) 的跳过（顺延次强）
     注意：这里用的是【执行日 d】的行情（打板买的就是这一天），不是信号日。"""
     for cd in (cands or []):
         cdf = stocks.get(cd)
@@ -634,6 +756,12 @@ def _s16_daban_pick(cands, stocks, maps, d):
             continue                       # 当日未封板 → 无从打板
         if bt._s16_is_unbuyable_limit(cdf, ck, S16_DABAN_SKIP_LIMIT_OPEN):
             continue                       # 一字/秒板 → 排队买不进
+        if max_turn is not None:
+            # ★2026-10-16 换手龙过滤：换手过高=分歧巨大/获利盘出逃，跳过并顺延次强。
+            #   None（缺列/NaN）同样跳过，与回测 _g(turn,1e9) 缺值按不满足处理一致。
+            _tv = _s16_turnover(cdf, ck)
+            if _tv is None or _tv > max_turn:
+                continue
         return (cd, cdf, ck)
     return None
 
@@ -757,21 +885,29 @@ def simulate_stock(sname, sfunc, afn, stocks, maps, buy_timing='open', sell_timi
                         pos = None
                         pending = {'action': 'buy', 'code': pending['switch_to'],
                                    'from_switch': True, 'from_frozen': True,
-                                   'stop': pending.get('stop'), 'sig_row': pending.get('sig_row')}
+                                   'stop': pending.get('stop'),
+                                   'ma20_slope': pending.get('ma20_slope'),
+                                   'sig_row': pending.get('sig_row')}
                         continue
                 break
             close = float(df.loc[k, '收盘'])
             # ★2026-09-23 S16 打板口径【顺延】：候买挂单在执行日按名次取第一个
             #   「当日封涨停且买得进」的标的；全池都买不进 → 当日空仓（信号不废弃，
             #   下方第 2 段照常收盘扫描出新信号）。换仓买入不参与顺延（它已有明确目标）。
+            # ★2026-10-14：S20 复用同一套打板校验（前缀判断由 'S16' 扩为 ('S16','S20')）。
+            #   S20 是"首板突破"，与 S16 的"连板龙头"标的池不重叠，扩前缀不影响 S16 任何行为。
             if (S16_DABAN_ENABLE and act == 'buy' and pos is None
-                    and str(sname).startswith('S16')):
+                    and str(sname).startswith(('S16', 'S20'))):
                 # 换仓买入【不顺延】（它已有明确的 switch_to 目标），但同样必须过打板校验：
                 # 目标当日未封板 / 一字·秒板 → 不买，暂空仓，次日按新信号重来。
                 # （否则换仓会绕过打板口径按开盘价买入，与回测口径不符）
                 _cands = ([code] if pending.get('from_switch')
                           else (pending.get('cand_pool') or [code]))
-                _pk = _s16_daban_pick(_cands, stocks, maps, d)
+                # ★2026-10-16 换手龙过滤【只给 S16】：S20 是首板突破口径，
+                #   其回测（data/bt_newskills_*.json）从未按换手筛选过，
+                #   故传 None 保持旧行为——两者共用本函数，绝不能一刀切。
+                _mt = S16_DABAN_MAX_TURNOVER if str(sname).startswith('S16') else None
+                _pk = _s16_daban_pick(_cands, stocks, maps, d, max_turn=_mt)
                 if _pk is None:
                     _nm0 = STOCKS.get(code, code)
                     row['note'] = (str(row.get('note') or '') +
@@ -835,6 +971,7 @@ def simulate_stock(sname, sfunc, afn, stocks, maps, buy_timing='open', sell_timi
                 # 动态换仓：卖出信号日已扫出触发候选 → 同一成交时段买入
                 pending = ({'action': 'buy', 'code': pending['switch_to'], 'from_switch': True,
                             'stop': pending.get('stop'),
+                            'ma20_slope': pending.get('ma20_slope'),
                             'sig_row': pending.get('sig_row')}
                            if pending.get('switch_to') else None)
             elif act == 'buy' and pos is None and not np.isnan(op) and op > 0:
@@ -946,6 +1083,57 @@ def simulate_stock(sname, sfunc, afn, stocks, maps, buy_timing='open', sell_timi
                         abandon_skip = True
                         pending = None
                         break  # 挂单已废，跳出循环；下方 abandon_skip 单独成行记录今日决策
+                # ★ 2026-10-14 执行日大跌/跌停废弃（仅**尾盘(收盘)买**策略，见 DISCARD_DROP_CLOSE）：
+                #   执行日收盘较昨收跌幅 ≤ 阈值 → 昨日"突破/强势"已被证伪，照收盘价买等于接跌停板。
+                #   默认 DISCARD_DROP_CLOSE 为空 → 本段不生效，任何策略行为不变。
+                _ddc = DISCARD_DROP_CLOSE.get(sname)
+                if (_ddc is not None and k > 0 and not pending.get('_daban')
+                        and not pending.get('stop') and buy_timing == 'close'):
+                    _dpc = float(df.loc[k - 1, '收盘']) if (k - 1) in df.index else float('nan')
+                    if _dpc > 0 and np.isfinite(_dpc) and np.isfinite(close) and close > 0:
+                        _dpct = close / _dpc - 1
+                        if _dpct <= _ddc:
+                            _dnm = STOCKS[code]
+                            _dr = _dpct * 100
+                            _dsr = pending.get('sig_row')
+                            if pending.get('from_switch'):
+                                # 换仓目标大跌：卖出已完成，不接力 → 当日暂空仓，收盘照常再扫新候选
+                                if pending.get('from_frozen'):
+                                    _frozen_row_base(row)  # 旧仓停牌挂账：当日行先落"卖出顺延"
+                                row['note'] = (row['note'] +
+                                               f'；换仓候选{_dnm}今日收盘{close:.2f}较昨收{_dpc:.2f}'
+                                               f'跌{abs(_dr):.1f}%，昨日信号预测失败，废弃不买入，暂空仓').strip()
+                                row['rec_buy'] = None
+                                row['abandon_note'] = (
+                                    f'原计划换仓买入 {_dnm}（{code}）已废弃未成交：今日收盘 {close:.2f} '
+                                    f'较昨收 {_dpc:.2f} 跌 {abs(_dr):.1f}%，昨日预测失败，'
+                                    '不机械买入，资金暂空仓')
+                                if _dsr is not None:
+                                    _drb = _dsr.get('rec_buy')
+                                    if _drb and _dnm in str(_drb):
+                                        _dsr['rec_buy'] = f'{_drb}（已废弃：执行日收盘跌{abs(_dr):.1f}%）'
+                                    _dsr['note'] = (str(_dsr.get('note') or '') +
+                                                    f'；[执行日收盘跌{abs(_dr):.1f}%（今收{close:.2f}'
+                                                    f'/昨收{_dpc:.2f}），换仓候选预测失败，信号废弃未执行]')
+                                pending = None
+                                break
+                            # 纯买入挂单废弃：回写信号日行，当日单独记录"废弃决策"
+                            if _dsr is not None:
+                                if _dsr.get('status') in ('买入信号', '买入信号(待成交)'):
+                                    _dsr['status'] = '信号废弃'
+                                _dsr['note'] = (str(_dsr.get('note') or '') +
+                                                f'；[执行日收盘跌{abs(_dr):.1f}%（今收{close:.2f}'
+                                                f'/昨收{_dpc:.2f}），昨日预测错误，信号废弃未执行]')
+                            row['status'] = '信号废弃'
+                            row['name'] = _dnm
+                            row['code'] = code
+                            row['price'] = _r(close)
+                            row['note'] = (f'信号执行日大跌（今日收盘{close:.2f}较昨收{_dpc:.2f}'
+                                           f'跌{abs(_dr):.1f}%）→ 昨日突破/强势已被证伪，'
+                                           '废弃不买入，暂空仓')
+                            abandon_skip = True
+                            pending = None
+                            break
                 if pending.get('_daban'):
                     # ★2026-09-23 打板口径：无论是否换仓，成交价一律取【当日收盘】（=涨停价）。
                     #   （旧逻辑里「止损换仓」会按开盘价买入，那是追高口径，不适用于打板）
@@ -968,7 +1156,8 @@ def simulate_stock(sname, sfunc, afn, stocks, maps, buy_timing='open', sell_timi
                 if shares >= 100:
                     cost = bt.buy_cost(px, shares)
                     pos = {'code': code, 'buy_date': d, 'buy_idx': k, 'buy_price': px,
-                           'shares': shares, 'cost': cost, 'peak_close': close}
+                           'shares': shares, 'cost': cost, 'peak_close': close,
+                           'ma20_slope': pending.get('ma20_slope')}
                     if pending.get('from_switch'):
                         if pending.get('from_frozen') and frozen is not None:
                             # ★ 2026-09-10 停牌日换仓：旧仓卖不掉（挂账 frozen），本日只发生换仓买入
@@ -1197,7 +1386,8 @@ def simulate_stock(sname, sfunc, afn, stocks, maps, buy_timing='open', sell_timi
                     pos['peak_close'] = max(pos['peak_close'], close)
                 ctx = {'entry_price': pos['buy_price'], 'peak_close': pos['peak_close'],
                        'ret': close / pos['buy_price'] - 1,
-                       'ret_from_peak': close / pos['peak_close'] - 1}
+                       'ret_from_peak': close / pos['peak_close'] - 1,
+                       'buy_idx': pos.get('buy_idx')}   # S21 超时卖出需按买入日算持有天数
                 try:
                     sig = sfunc(k, df, ctx)
                 except Exception:
@@ -1219,8 +1409,9 @@ def simulate_stock(sname, sfunc, afn, stocks, maps, buy_timing='open', sell_timi
                     sig = None  # 策略卖出信号但持有期未满：延迟卖出，继续持有
                 elif sig == 'sell' or sig == 'sell_stop':
                     # ★2026-09-18 S16 出场时点 A/B：断板当日收盘卖（默认 S16_SELL_SAME_CLOSE=False → 走下面现行挂单口径）
-                    if (sig == 'sell' and S16_SELL_SAME_CLOSE and str(sname).startswith('S16')
-                            and held_days >= 1):
+                    if (sig == 'sell' and held_days >= 1
+                            and ((S16_SELL_SAME_CLOSE and str(sname).startswith('S16'))
+                                 or str(sname) in SELL_SAME_CLOSE_EXTRA)):
                         _sh = pos['shares']
                         _cost = pos['cost']
                         _bp = pos['buy_price']
@@ -1258,12 +1449,14 @@ def simulate_stock(sname, sfunc, afn, stocks, maps, buy_timing='open', sell_timi
                         pending = {'action': 'sell', 'code': code, 'stop': is_stop,
                                    'sig_row': row}  # 信号日行引用：执行日开盘接力失败时可回写"废弃"
                         # 同日收盘再扫描买入候选：动态换仓候选（仅当日及之前数据，排除刚平仓的持仓股）
-                        rec = _scan_best(stocks, maps, d, afn, exclude=code)
+                        _rk = S21_ORDER_KEY if str(sname).startswith('S21') else None
+                        rec = _scan_best(stocks, maps, d, afn, exclude=code, order_key=_rk)
                         if rec and rec.get('triggered'):
                             _ok, _flt = _filter_pass(sname, d)  # 换仓候选同样过买入过滤器
                             if _ok:
                                 row['rec_buy'] = f"{STOCKS[rec['code']]}（评分{rec.get('score')}）"
                                 pending['switch_to'] = rec['code']
+                                pending['ma20_slope'] = rec.get('ma20_slope')
                             else:
                                 row['rec_buy'] = f"{STOCKS[rec['code']]}（评分{rec.get('score')}，被{_flt}过滤）"
                 if bought_today:
@@ -1296,6 +1489,39 @@ def simulate_stock(sname, sfunc, afn, stocks, maps, buy_timing='open', sell_timi
                                                   '（沿用前收，复牌日按当日行情重新判定）')
                         else:
                             row['note'] = _swp + f'成本{pos["buy_price"]:.2f} 现价{close:.2f} 浮盈{(close/pos["buy_price"]-1)*100:.1f}%'
+                            # ★2026-10-28 S21 持仓中主动换仓：出现 MA20 斜率明显更弱的新信号 → 卖出换入。
+                            #   依据（_s21_switch2.py 全史 193 笔/单持仓全仓/9日持仓）：
+                            #     不换仓 +32.7% → 换仓(优10%) +38.7%；剔除 2024 后仍 +28.0%，9年8年为正。
+                            #   与「卖出信号日换仓」的区别：本分支没有卖出信号，是主动追更优标的。
+                            if (S21_SWITCH_ENABLE and str(sname).startswith('S21')
+                                    and not _susp_frame and pending is None
+                                    and held_days >= S21_SWITCH_MIN_HOLD):
+                                _cur = pos.get('ma20_slope')
+                                if _cur is not None:
+                                    _rec = _scan_best(stocks, maps, d, afn, exclude=code,
+                                                      order_key=S21_ORDER_KEY)
+                                    _new = (_rec or {}).get('ma20_slope')
+                                    if (_rec and _rec.get('triggered') and _new is not None
+                                            and _new < _cur * (1 - S21_SWITCH_MARGIN)):
+                                        _ok2, _flt2 = _filter_pass(sname, d)
+                                        if _ok2:
+                                            pending = {'action': 'sell', 'code': code,
+                                                       'switch_to': _rec['code'],
+                                                       'from_switch': True, 'stop': False,
+                                                       'ma20_slope': _new, 'sig_row': row}
+                                            row['status'] = '换仓卖出信号'
+                                            row['rec_buy'] = (f"{STOCKS[_rec['code']]}"
+                                                              f"（MA20斜率{_new * 100:.1f}%）")
+                                            row['note'] = _swp + (
+                                                f'持仓中换仓：新候选{STOCKS[_rec["code"]]}'
+                                                f'MA20斜率{_new * 100:.1f}% 优于持仓{_cur * 100:.1f}%'
+                                                f'（幅度>{S21_SWITCH_MARGIN * 100:.0f}%）；'
+                                                f'成本{pos["buy_price"]:.2f} 现价{close:.2f} '
+                                                f'浮盈{(close / pos["buy_price"] - 1) * 100:.1f}%，'
+                                                f'明日{ns}卖出后换入')
+                                        else:
+                                            row['note'] += (f'；换仓候选{STOCKS[_rec["code"]]}'
+                                                            f'被{_flt2}过滤，继续持有')
                 if pos is not None:   # ★2026-09-18：断板当日收盘即时成交后 pos 已清空，不再写持仓浮盈字段
                     row['pos_cost'] = _r(pos['buy_price'])
                     row['pos_pnl_pct'] = round((close / pos['buy_price'] - 1) * 100, 2)
@@ -1340,6 +1566,7 @@ def simulate_stock(sname, sfunc, afn, stocks, maps, buy_timing='open', sell_timi
                     records.append(row)
                 continue
             max_signals = MAX_DAILY_SIGNALS.get(sname, 1)  # 每日信号/买入笔数上限（可配置）
+            _pk = S21_ORDER_KEY if str(sname).startswith('S21') else None
             best = None
             trig = []
             for code in STOCKS:
@@ -1357,7 +1584,13 @@ def simulate_stock(sname, sfunc, afn, stocks, maps, buy_timing='open', sell_timi
                     continue
                 r = dict(r)
                 r['code'] = code
-                if best is None or r['score'] > best['score']:
+                if _pk:                     # ★S21：按 ma20_slope 升序挑「趋势最弱」
+                    kv = r.get(_pk)
+                    if kv is None:
+                        continue
+                    if best is None or kv < best[_pk]:
+                        best = r
+                elif best is None or r['score'] > best['score']:
                     best = r
                 if r.get('triggered'):
                     trig.append(r)
@@ -1365,7 +1598,10 @@ def simulate_stock(sname, sfunc, afn, stocks, maps, buy_timing='open', sell_timi
                 if max_signals == 0:
                     best = dict(best); best['triggered'] = False  # 限额0：当天禁买
                 elif trig:
-                    trig.sort(key=lambda x: x['score'], reverse=True)
+                    if _pk:
+                        trig.sort(key=lambda x: x[_pk])   # 升序：MA20 斜率最小者排第一
+                    else:
+                        trig.sort(key=lambda x: x['score'], reverse=True)
                     trig = trig[:max_signals]  # 仅评分最高的 max_signals 个触发信号有效
                     if not any(t['code'] == best['code'] for t in trig):
                         # 修复(2026-08-28)：评分第一的股票常是「已强势多日」而非「当日触发」的股票
@@ -1392,12 +1628,17 @@ def simulate_stock(sname, sfunc, afn, stocks, maps, buy_timing='open', sell_timi
                 #   次日开盘是否买得进完全交给执行日守卫（低开证伪/顶板买不进→废弃成行记录）。
                 if best['triggered']:
                     pending = {'action': 'buy', 'code': best['code'],
+                               'ma20_slope': best.get('ma20_slope'),
                                'sig_row': row}  # 信号日行引用（次日开盘低开废弃时回写标注）
                     # ★2026-09-23 打板口径：把【信号日】候选池（按名次）随挂单带到执行日，
                     #   执行日按名次取第一个"当日封板且买得进"的（龙一买不进 → 打板买龙二…），
                     #   与回测 run_s16_daban_pool_market 的 pool→sigs 顺序完全一致。
                     if S16_DABAN_ENABLE and str(sname).startswith('S16'):
-                        pending['cand_pool'] = _s16_cand_pool(d) or [best['code']]
+                        # ★2026-10-26：顺延候选池必须与信号选股同连板区间，
+                        #   否则会按名次顺延到【更高板】的票，把连板上限绕过去。
+                        pending['cand_pool'] = (_s16_cand_pool(
+                            d, lb_range=getattr(bt, 'S16_LB_RANGE', None))
+                            or [best['code']])
                 if sold_today or row['status'] == '资金不足':
                     if best['triggered']:
                         row['note'] = (row['note'] + f"；收盘再现买入信号：{STOCKS[best['code']]}（评分{best.get('score')}，{nb}可买）").strip()
