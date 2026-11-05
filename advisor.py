@@ -12,6 +12,11 @@ import backtest as bt
 STOCKS = bt.STOCKS
 _ALL = list(bt.STRATEGIES.keys()) + ['S7_沪深300PE分批低买高卖', 'S8_红利低估值分批买入']
 
+# ★2026-11-05(#19) 总市值≤250亿硬闸门：只作用于「全市场选股扫描」。
+#   codes 显式指定时(盘中持仓跟踪)不过滤，避免历史遗留大票持仓失去跟踪。
+from stock_bot import universe_cap as UC
+SELECTABLE = UC.selectable_codes(STOCKS.keys(), label="advisor 推荐池")
+
 # ★2026-10-30 改为【白名单】：只推荐被实证验证的两个策略，其余全部不进入轮换
 #   （仍在账本继续生成，保留历史留痕与复盘可查；清空本集合即恢复全量）。
 #
@@ -539,7 +544,7 @@ def scan_stock_strategy(sname, realtime=None, codes=None):
         _want = {str(c) for c in codes}
         _pool = [(c, n) for c, n in STOCKS.items() if c in _want]
     else:
-        _pool = list(STOCKS.items())
+        _pool = [(c, n) for c, n in STOCKS.items() if c in SELECTABLE]  # ★#19 250亿硬闸门
     out = []
     for code, name in _pool:
         try:

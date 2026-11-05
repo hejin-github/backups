@@ -298,11 +298,18 @@ def eligible(code, name):
 
 STOCKS = {c: n for c, n in bt.STOCKS.items() if eligible(c, n)}
 
+# ★2026-11-05(#19) 用户硬条件：所有选股统一「总市值 ≤ 250亿」。
+#   只收窄**加载宇宙**(load_all 读哪些标的 → 候选/动态池自然继承)，
+#   STOCKS 字典保持全量供历史名称查找(STOCKS[code])，避免旧持仓/旧记录 KeyError。
+#   父目录 backtest.py 的历史回测宇宙不变；本工程账本重放口径变更已在 OOS_REPORT 披露。
+from stock_bot import universe_cap as UC
+SELECTABLE = UC.selectable_codes(STOCKS.keys(), label="stock_bot 选股宇宙")
+
 
 def load_all():
     stocks = {}
     skipped = []        # 空/损坏/数据不足的标的（★2026-09-15 起汇总打印，避免"静默缺票"）
-    for code in STOCKS:
+    for code in SELECTABLE:   # ★#19 总市值≤250亿硬闸门（合规宇宙）
         try:
             df = bt.load_stock(code)
             if df is None or df.empty:
@@ -2103,7 +2110,7 @@ def build(realtime=None, intraday=False):
         'start': START_STR,
         'end': max(calendar_of(stocks)),
         'capital': CAPITAL,
-        'pool': [{'code': c, 'name': n} for c, n in STOCKS.items()],
+        'pool': [{'code': c, 'name': n} for c, n in STOCKS.items() if c in SELECTABLE],
         'note': '股票池已剔除创业板(300)/科创板(688)/ST/退市，仅沪深主板；信号收盘后确定，各策略按最适合自己的成交时点执行（见各策略标注：早盘=次日开盘价、尾盘=次日收盘价，经 timing_backtest 回测选优+策略逻辑综合），卖出后按当日触发候选自动换仓；指数策略含浮亏8%止损/最长持有期；T+1涨跌=选股标的下一个交易日开盘相对信号日收盘的涨跌幅。',
         'strategies': [],
     }
